@@ -626,6 +626,13 @@ class NanoAGI:
                         candidates[i] = meta.unigram[i]
             if not candidates:
                 break
+            # Hebbian boost — gentle contextual reinforcement on top of trigram/bigram
+            ctx = generated[-4:]
+            for tok in list(candidates.keys()):
+                for ct in ctx:
+                    key = (min(tok, ct), max(tok, ct))
+                    if key in meta.hebbian:
+                        candidates[tok] *= (1.0 + 0.3 * meta.hebbian[key])
             # Repetition penalty
             recent = generated[-12:] if len(generated) >= 12 else generated
             recent_counts = {}
@@ -1081,7 +1088,7 @@ def load_engine():
         token_ids = karl.encode(raw_data)
         print(f"  Loaded previous state. Encoding: {len(token_ids)} tokens")
     else:
-        token_ids = karl.learn(raw_data, num_merges=512)
+        token_ids = karl.learn(raw_data, num_merges=1024)
 
     # MetaWeights
     print(f"\n[3] Building metaweights...")
