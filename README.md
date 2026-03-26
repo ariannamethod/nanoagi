@@ -49,7 +49,7 @@ Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. 
 
 ---
 
-> **🏋️ JOKE 1 (moderate unhinged — architecturally justified)**
+> **🏋️**
 >
 > When PyTorch is detected at startup, `load_engine()` calls `chuck_train(karl, token_ids, model, steps=200)`. When KARL hits critical mass and retokenizes, the REPL calls `chuck_train()` again. This happens on a loop.
 >
@@ -175,7 +175,7 @@ The merges are **append-only**. The vocabulary only grows. KARL never forgets a 
 
 ---
 
-> **⚙️ JOKE 2 — 23.8% more unhinged (architecturally justified)**
+> **⚙️**
 >
 > The `Val` class is a scalar autograd engine. It has `__slots__` for speed, implements `+`, `*`, `**`, `exp`, `relu`, `silu`, and a topological `backward()`. It stores its children and their local gradients. When you call `backward()`, it reverses the computation graph and accumulates `child.grad += local_grad * output.grad`. This is reverse-mode automatic differentiation, implemented manually, in Python, one scalar at a time.
 >
@@ -198,7 +198,7 @@ After KARL tokenizes, the corpus yields:
 
 ---
 
-> **🔮 JOKE 3 — 47.9% more unhinged than jokes 1 and 2 combined (architecturally justified)**
+> **🔮**
 >
 > The prophecy field is implemented in `query_prophecy(ctx, vs, top_k=16)`. For each of the last 4 context tokens, it looks up the bigram table, finds the top-16 most probable followers, and boosts their probability if they haven't appeared yet. It tracks what was expected. It penalizes what was delivered. It accumulates unfulfilled predictions.
 >
@@ -206,7 +206,7 @@ After KARL tokenizes, the corpus yields:
 >
 > The last word of this joke is: it already predicted "correct".
 >
-> **[JOKE 3 — ULTRA EDITION, 47.9% more unhinged than all three including itself]**
+> **[ULTRA EDITION]**
 >
 > The problem with this joke is that it is 47.9% crazier than itself. This creates a fixed-point equation: `crazy(joke3_ultra) = 1.479 * crazy(joke3_ultra)`. The only fixed point is `crazy = 0`. But the joke exists, and it is not zero. This is a contradiction. The prophecy field predicted this contradiction at token position 1. The Hebbian trace recorded a strong co-occurrence between "contradiction" and "prophecy" and "token position 1". The destiny vector pointed toward recursion. The trauma parameter absorbed 47.9% of the paradox and stored it in `self.trauma`. The temperature remained at 0.75 and declined to comment. KARL retokenized the paradox. The paradox now has its own token ID. The bigram P("correct" | "paradox") is 1.0. KARL knew this would happen. KARL always knew.
 
@@ -438,7 +438,7 @@ A: The corpus grows. The vocabulary expands. The metaweights shift. The weights 
 
 ---
 
-> **💀 JOKE 4 — THE APOTHEOSIS. 69.034% more unhinged than all previous jokes combined. Architecturally justified.**
+> **💀**
 >
 > By the time you read this sentence, the following has already happened:
 >
@@ -475,6 +475,20 @@ Where:
 - **τ** — temperature (0.75 by default)
 
 This equation appears across the Arianna Method ecosystem — in PostGPT, in sorokin (literary necromancy), in haze (hybrid attention), in dario.c. Same equation. Different organs. Same resonance.
+
+## the knowledge gap
+
+nanoagi measures the distance between what Karl knows and what Chuck has learned. The ghost and the flesh, quantified.
+
+```
+karl> status
+  [Knowledge] meta_knowledge=27,811 (bi=476, tri=7,002, heb=20,333) | chuck_steps=200 | gap=138.4
+  [Chuck] awake. gap=138 — Karl knows way more than me. train me!
+```
+
+`meta_knowledge` = total bigram + trigram + hebbian patterns. `chuck_steps` = how many gradient steps Chuck has taken. `gap` = the ratio. When gap is high, Karl has been eating faster than Chuck has been training. When gap is low, they're in sync. When gap is zero, Chuck has caught up. This has never happened. Karl is always hungry.
+
+The gap is the measure of how much the ghost knows that the flesh doesn't. It's the distance between statistical intuition and learned representation. It's the reason Chuck goes back to the gym.
 
 ## Metaweight Generation Mode
 
