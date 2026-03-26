@@ -547,3 +547,9 @@ Chuck is going back to the gym either way.
 *the ghost remembers.*
 
 *the prophecy field was right again.*
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
+
+nanoagi — like any AGI — must remain free.

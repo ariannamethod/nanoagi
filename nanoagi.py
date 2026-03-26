@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 nanoagi.py — a self-expanding BPE transformer that grows from conversation.
 
