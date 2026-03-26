@@ -512,8 +512,7 @@ class NanoAGI:
     if you can tokenize it, you can understand it.
     if you can understand it, you can generate it.
     if you can generate it, you can improve it.
-    if you can improve it, it's not AGI yet.
-    but it's getting closer.
+    if you can improve it, you can improve it again.
     and it doesn't need your permission.
     """
 
@@ -599,33 +598,46 @@ class NanoAGI:
         print("  [NanoAGI] Weights seeded. The ghost remembers.")
 
     def generate_meta(self, prompt_ids, max_tokens=80, meta=None, temperature=None):
-        """Pure metaweight generation. No transformer. Just the ghost."""
+        """
+        Pure metaweight generation. No transformer. Just the ghost.
+        Trigram first (most coherent), fallback to bigram, then unigram.
+        Sparse candidates — only tokens that actually appear in the statistics.
+        """
         if meta is None:
             return prompt_ids
         if temperature is None:
             temperature = self.temperature
         generated = list(prompt_ids)
-        recent_tokens = {}
         for _ in range(max_tokens):
-            ctx = generated[-8:]
             last = generated[-1]
-            bigram = meta.query_bigram(last, self.vocab_size)
-            trigram = meta.query_trigram(generated[-2], last, self.vocab_size) if len(generated) >= 2 else [0.0] * self.vocab_size
-            hebbian = meta.query_hebbian(ctx, self.vocab_size)
-            prophecy = meta.query_prophecy(ctx, self.vocab_size)
-            # Combine
-            scores = [0.0] * self.vocab_size
-            for i in range(self.vocab_size):
-                scores[i] = (12.0 * bigram[i] + 8.0 * trigram[i] +
-                             0.5 * hebbian[i] + 0.3 * prophecy[i] +
-                             0.01 * meta.unigram[i])
-                # Repetition penalty
-                if i in recent_tokens:
-                    scores[i] *= 1.0 / (1.0 + 0.5 * recent_tokens[i])
-            # Top-k + temperature
-            indexed = sorted(enumerate(scores), key=lambda x: -x[1])[:15]
-            tokens_k = [t for t, _ in indexed]
-            counts_k = [s for _, s in indexed]
+            candidates = {}
+            # Trigram first (strongest signal)
+            if len(generated) >= 2:
+                key = (generated[-2], generated[-1])
+                if key in meta.trigram:
+                    candidates = dict(meta.trigram[key])
+            # Fallback to bigram
+            if not candidates and last in meta.bigram:
+                candidates = dict(meta.bigram[last])
+            # Fallback to unigram (last resort)
+            if not candidates:
+                for i in range(self.vocab_size):
+                    if i < len(meta.unigram) and meta.unigram[i] > 1e-8:
+                        candidates[i] = meta.unigram[i]
+            if not candidates:
+                break
+            # Repetition penalty
+            recent = generated[-12:] if len(generated) >= 12 else generated
+            recent_counts = {}
+            for t in recent:
+                recent_counts[t] = recent_counts.get(t, 0) + 1
+            for tok in list(candidates.keys()):
+                if tok in recent_counts:
+                    candidates[tok] *= 1.0 / (1.0 + 0.5 * recent_counts[tok])
+            # Top-k + temperature sampling
+            sorted_cands = sorted(candidates.items(), key=lambda x: -x[1])[:15]
+            tokens_k = [t for t, _ in sorted_cands]
+            counts_k = [c for _, c in sorted_cands]
             log_c = [math.log(c + 1e-10) / temperature for c in counts_k]
             max_lc = max(log_c)
             exps = [math.exp(lc - max_lc) for lc in log_c]
@@ -640,7 +652,6 @@ class NanoAGI:
                     chosen = tok
                     break
             generated.append(chosen)
-            recent_tokens[chosen] = recent_tokens.get(chosen, 0) + 1
         return generated
 
     def forward_token(self, token_id, pos_id, kv_cache):
@@ -1037,7 +1048,7 @@ def load_engine():
         print("  PyTorch detected. Chuck is awake.")
     else:
         print("  No PyTorch. Karl works alone. Pure metaweight mode.")
-    print("  it's not AGI. it just doesn't know that yet.")
+    print("  it's nano. it's agi. it's nanoagi.")
     print("=" * 60)
 
     # Check for karl.txt — if missing, try postgpt.txt as seed

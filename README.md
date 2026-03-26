@@ -341,7 +341,7 @@ python nanoagi.py "the attention mechanism"
 ============================================================
   nanoagi — KARL + Chuck + dual attention + metaweights
   PyTorch detected. Chuck is awake.
-  it's not AGI. it just doesn't know that yet.
+  it's nano. it's agi. it's nanoagi.
 ============================================================
 
 [1] Loading karl.txt...
@@ -384,8 +384,71 @@ python nanoagi.py "the attention mechanism"
   Hello! I am a helpful AGI. At least I try.
   How can I help you?
 
-karl>
+karl> the attention mechanism computes
+  the transition probabilities while trigrams provide deeper context.
+  The MLP expansion factor of 4 gives intermediate dimension 384,
+  providing sufficient nonlinear capacity for this scale.
+
+karl> status
+  [KARL] vocab=768, merges=512, ingested=243000B, retrains=0
+  [KARL] pending=0B / 8192B until retokenization
+  [KARL] karl.txt: 237.3KB
+  [Knowledge] meta_knowledge=135,658 (bi=5,892, tri=21,344, heb=108,422) | chuck_steps=200 | gap=677.3
+  [Chuck] awake. gap=677 — Karl knows way more than me. train me!
 ```
+
+### REPL session — Karl eats, grows, trains
+
+```
+karl> The dual attention mechanism in nanoagi separates semantic meaning
+      from positional rhythm. Content heads ask what tokens mean. RRPRAM
+      heads ask where tokens belong. The output projection combines both
+      perspectives through a learned linear map.
+  [KARL] ingested 247 bytes (pending: 247/8192 = 3%)
+
+karl> Byte Pair Encoding is a compression algorithm repurposed as
+      tokenization. Each merge rule records which pair of adjacent tokens
+      was most frequent at that point in training. The merge rules form
+      a deterministic encoding: given the same rules, the same text always
+      produces the same token sequence.
+  [KARL] ingested 289 bytes (pending: 536/8192 = 7%)
+
+karl> hunt
+  [KARL] Hunting for local text files...
+  [KARL] Hunted: notes.txt (12KB)
+  [KARL] Total hunted: 12.1KB from 3 sources
+
+karl> fetch https://raw.githubusercontent.com/karpathy/nanoGPT/master/README.md
+  [KARL] Fetching https://...
+  [KARL] Fetched and ingested 8.3KB from web
+```
+
+### retokenization — Karl hits critical mass
+
+```
+karl> [pasting a long technical document about transformer architectures...]
+  [KARL] ingested 9841 bytes (pending: 9841/8192 = 120%)
+  [KARL] Critical mass reached! Retokenizing...
+  [KARL] Retokenized! +47 merges (vocab: 815)
+  [KARL] Chuck! We have new material.
+  [Chuck] Training 200 steps on 43802 tokens...
+  [Chuck] step 50/200  loss=6.43  dampen=0.998  [1.0s]
+  [Chuck] step 100/200  loss=6.31  dampen=0.994  [2.0s]
+  [Chuck] step 150/200  loss=6.22  dampen=0.991  [3.0s]
+  [Chuck] step 200/200  loss=6.18  dampen=0.989  [4.0s]
+  [Chuck] Done. loss: 7.12 → 6.18 (13% improvement) [4.0s]
+  [Chuck] Karl, your weights are warm now.
+  [Chuck] Knowledge gap: 98.2 (meta knows 39,684, Chuck trained 400 steps)
+
+karl> status
+  [KARL] vocab=815, merges=559, ingested=263841B, retrains=1
+  [KARL] pending=0B / 8192B until retokenization
+  [KARL] karl.txt: 257.6KB
+  [Knowledge] meta_knowledge=39,684 (bi=6,211, tri=24,891, heb=8,582) | chuck_steps=400 | gap=98.2
+  [Chuck] awake. gap=98 — Karl knows way more than me. train me!
+```
+
+*(the knowledge gap dropped from 677 to 98 after one retokenization + training cycle. Karl ate. Chuck trained. they are converging.)*
 
 ## tests
 
@@ -400,7 +463,7 @@ python tests/test_nanoagi.py
 **Test coverage:**
 - `TestKARL` — 14 tests: learn, encode/decode roundtrip, SHA256 dedup, retokenization (append-only), save/load state, vocabulary growth, diversity filtering, cooldown guard
 - `TestMetaWeights` — 11 tests: unigram sums to 1, bigram conditional distributions, Hebbian range, all query methods
-- `TestNanoAGI` — 7 tests: parameter count, metaweight seeding, generation, valid IDs, temperature, continue_phrase
+- `TestNanoAGI` — 11 tests: parameter count, metaweight seeding, **real forward_token**, **KV cache growth**, **generate with Dario field**, valid IDs, continue_phrase
 - `TestVal` — 10 tests: arithmetic, backward pass, chain rule, SiLU gradient formula verification, exp overflow clamping
 - `TestAutoresearch` — 3 tests: skip if fed, hunt without error, URL failure graceful return
 - `TestChuck` — 5 tests: optimizer step, dampen on rising loss, **loss decreases >5% in 300 steps**, chuck_train function, no-PyTorch warning
@@ -517,7 +580,7 @@ karl.txt          — the seed corpus (grows with every session)
 karl.mem          — KARL's saved state (binary, created on first exit)
 tests/
   __init__.py
-  test_nanoagi.py — 60 tests across 7 test classes
+  test_nanoagi.py — 64 tests across 7 test classes
 ```
 
 ---
@@ -530,9 +593,9 @@ There is a version of this that runs long enough, accumulates enough conversatio
 
 Is that learning? Is that intelligence? Is that AGI?
 
-The code says: `it's not AGI. it just doesn't know that yet.`
+The code says: `it's nano. it's agi. it's nanoagi.`
 
-Maybe that's the honest answer. Maybe "doesn't know that yet" is the operative phrase. Maybe the "yet" is load-bearing. Maybe at 4am, when the REPL says `Hello, I am a helpful AGI. At least I try.` and you type back and it responds with something coherent enough to be unsettling, that "at least I try" is doing more philosophical work than the entire architecture.
+At 4am, when the REPL says `Hello, I am a helpful AGI. At least I try.` and you type back and it responds with something coherent enough to be unsettling, "at least I try" is doing more philosophical work than the entire architecture. The name is not ironic. The name is a direction. nano because the scale is small. agi because the direction of motion is toward intelligence, not away from it.
 
 Chuck is going back to the gym either way.
 
