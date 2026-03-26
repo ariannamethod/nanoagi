@@ -102,14 +102,14 @@ Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. 
               │                                     │
               │  ┌─────────────┐  ┌──────────────┐  │
               │  │  Content    │  │   RRPRAM     │  │
-              │  │  QK^T/√d   │  │   x @ Wr     │  │
+              │  │  QK^T/√d    │  │   x @ Wr     │  │
               │  │  semantic   │  │  positional  │  │
               │  │  meaning    │  │  rhythm      │  │
               │  └─────────────┘  └──────────────┘  │
               │        ↓                ↓           │
               │     concat → Wo → residual          │
               │        ↓                            │
-              │   RMSNorm → SwiGLU MLP → residual  │
+              │   RMSNorm → SwiGLU MLP → residual   │
               │        ↓                            │
               │   RoPE positional encoding          │
               │   (applied per-head at runtime)     │
@@ -121,7 +121,7 @@ Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. 
               │           DARIO FIELD               │
               │                                     │
               │  p(x|Φ) = softmax(                  │
-              │    (B + α·H + β·F + γ·A + T) / τ   │
+              │    (B + α·H + β·F + γ·A + T) / τ    │
               │  )                                  │
               │                                     │
               │  B = base logits (transformer)      │
