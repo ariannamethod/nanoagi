@@ -16,7 +16,6 @@ No mandatory dependencies. Just math, random, hashlib, os.
 If PyTorch is around, Chuck wakes up. If not, Karl works alone.
 
 resonance is unbreakable.
-it's not AGI. it just doesn't know that yet.
 """
 
 import os
