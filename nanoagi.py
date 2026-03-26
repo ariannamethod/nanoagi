@@ -686,8 +686,117 @@ if TORCH_AVAILABLE:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VI. ENGINE — Karl + Chuck + NanoAGI + MetaWeights = nanoagi
-#     the moment of truth. or the moment of coherent bullshit. same thing.
+# VI. AUTORESEARCH — Karl hunts for food. inspired by @karpathy/autoresearch.
+#     when the corpus is small, Karl looks for more text. anywhere.
+#     he's not picky. he's hungry.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def autoresearch(karl, karl_txt_path, min_bytes=50000):
+    """
+    If karl.txt is too small, Karl hunts for more text.
+    Checks common locations for text files and ingests them.
+    Like Karpathy's autoresearch, but without the agents.
+    Karl IS the agent.
+    """
+    current_size = os.path.getsize(karl_txt_path) if os.path.exists(karl_txt_path) else 0
+    if current_size >= min_bytes:
+        return 0  # Karl is fed
+
+    print(f"  [KARL] Corpus too small ({current_size/1024:.0f}KB). Hunting for text...")
+    hunted = 0
+
+    # Hunt in common places
+    hunt_paths = []
+
+    # 1. Any .txt files in same directory
+    script_dir = os.path.dirname(os.path.abspath(karl_txt_path))
+    for f in os.listdir(script_dir):
+        if f.endswith('.txt') and f != os.path.basename(karl_txt_path):
+            hunt_paths.append(os.path.join(script_dir, f))
+
+    # 2. README files in parent directories
+    for depth in range(3):
+        parent = os.path.dirname(script_dir)
+        for _ in range(depth):
+            parent = os.path.dirname(parent)
+        for name in ['README.md', 'README.txt', 'readme.md']:
+            p = os.path.join(parent, name)
+            if os.path.exists(p):
+                hunt_paths.append(p)
+
+    # 3. Common corpus locations
+    home = os.path.expanduser('~')
+    for subdir in ['Downloads', 'Documents', 'Desktop']:
+        d = os.path.join(home, subdir)
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.endswith('.txt') and os.path.getsize(os.path.join(d, f)) < 500000:
+                    hunt_paths.append(os.path.join(d, f))
+                    if len(hunt_paths) > 20:  # don't go crazy
+                        break
+
+    # Ingest what we found
+    with open(karl_txt_path, 'a', encoding='utf-8', errors='replace') as corpus:
+        for path in hunt_paths:
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                if len(text) < 100:
+                    continue
+                if karl.ingest(text):
+                    corpus.write('\n' + text)
+                    hunted += len(text)
+                    print(f"  [KARL] Hunted: {os.path.basename(path)} ({len(text)/1024:.0f}KB)")
+            except (PermissionError, OSError):
+                continue
+
+    if hunted > 0:
+        print(f"  [KARL] Total hunted: {hunted/1024:.1f}KB from {len(hunt_paths)} sources")
+    else:
+        print(f"  [KARL] Nothing to hunt. Karl stays hungry.")
+
+    return hunted
+
+
+def autoresearch_url(karl, karl_txt_path, url=None):
+    """
+    Karl hunts the internet. If urllib is available.
+    Fetches a URL, strips HTML (crudely), ingests text.
+    """
+    try:
+        from urllib.request import urlopen
+    except ImportError:
+        return 0
+
+    if url is None:
+        # Default: fetch something educational
+        urls = [
+            "https://raw.githubusercontent.com/karpathy/nanoGPT/master/README.md",
+            "https://raw.githubusercontent.com/ariannamethod/postgpt/main/README.md",
+        ]
+        url = random.choice(urls)
+
+    try:
+        print(f"  [KARL] Fetching {url}...")
+        response = urlopen(url, timeout=10)
+        text = response.read().decode('utf-8', errors='replace')
+        # Crude HTML stripping
+        import re
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if karl.ingest(text):
+            with open(karl_txt_path, 'a', encoding='utf-8') as f:
+                f.write('\n' + text)
+            print(f"  [KARL] Fetched and ingested {len(text)/1024:.1f}KB from web")
+            return len(text)
+    except Exception as e:
+        print(f"  [KARL] Failed to fetch: {e}")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VII. ENGINE — Karl + Chuck + NanoAGI + MetaWeights = nanoagi
+#      the moment of truth. or the moment of coherent bullshit. same thing.
 # ─────────────────────────────────────────────────────────────────────────────
 
 KARL_TXT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'karl.txt')
@@ -723,8 +832,13 @@ def load_engine():
         raw_data = f.read()
     print(f"  Corpus: {len(raw_data)} bytes ({len(raw_data)/1024:.1f}KB)")
 
+    # Autoresearch: Karl hunts for food if corpus is small
+    print(f"\n[2] Autoresearch...")
+    karl_tmp = KARL()  # temp instance for ingestion tracking
+    autoresearch(karl_tmp, KARL_TXT, min_bytes=50000)
+
     # KARL tokenizer
-    print(f"\n[2] KARL tokenizer...")
+    print(f"\n[3] KARL tokenizer...")
     karl = KARL(max_merges=2048)
     if karl.load_state(KARL_MEM):
         token_ids = karl.encode(raw_data)
@@ -753,7 +867,119 @@ def load_engine():
     print(f"\n[5] Seeding weights from metaweights...")
     model.init_from_metaweights(meta)
 
+    # If Chuck is here, initial training
+    if TORCH_AVAILABLE:
+        print(f"\n[6] Chuck smells PyTorch. Initial training...")
+        chuck_train(karl, token_ids, model, steps=200)
+
     return karl, meta, model
+
+
+def chuck_train(karl, token_ids, model, steps=200):
+    """
+    Chuck wakes up and trains real weights.
+    Karl called. Smells like PyTorch. Time to work.
+    """
+    if not TORCH_AVAILABLE:
+        print("  [Chuck] Can't train. No PyTorch. Go away.")
+        return
+
+    print(f"  [Chuck] Training {steps} steps on {len(token_ids)} tokens...")
+
+    # Build PyTorch model matching NanoAGI architecture
+    class _RMSNorm(nn.Module):
+        def __init__(self, dim, eps=1e-5):
+            super().__init__()
+            self.eps = eps
+            self.weight = nn.Parameter(torch.ones(dim))
+        def forward(self, x):
+            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+    class TorchNanoAGI(nn.Module):
+        def __init__(self, vocab_size, n_embd=64, n_head=4, n_layer=3, ctx=64):
+            super().__init__()
+            self.ctx = ctx
+            self.wte = nn.Embedding(vocab_size, n_embd)
+            self.blocks = nn.ModuleList()
+            for _ in range(n_layer):
+                self.blocks.append(nn.ModuleDict({
+                    'norm1': _RMSNorm(n_embd),
+                    'attn': nn.Linear(n_embd, n_embd * 3, bias=False),
+                    'proj': nn.Linear(n_embd, n_embd, bias=False),
+                    'norm2': _RMSNorm(n_embd),
+                    'mlp_gate': nn.Linear(n_embd, n_embd * 4, bias=False),
+                    'mlp_up': nn.Linear(n_embd, n_embd * 4, bias=False),
+                    'mlp_down': nn.Linear(n_embd * 4, n_embd, bias=False),
+                }))
+            self.norm_f = _RMSNorm(n_embd)
+            self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+            self.lm_head.weight = self.wte.weight  # weight tying
+
+        def forward(self, idx, targets=None):
+            B, T = idx.shape
+            x = self.wte(idx)
+            for block in self.blocks:
+                xn = block['norm1'](x)
+                qkv = block['attn'](xn)
+                q, k, v = qkv.chunk(3, dim=-1)
+                nh = 4
+                hd = q.shape[-1] // nh
+                q = q.view(B, T, nh, hd).transpose(1, 2)
+                k = k.view(B, T, nh, hd).transpose(1, 2)
+                v = v.view(B, T, nh, hd).transpose(1, 2)
+                attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
+                mask = torch.triu(torch.ones(T, T, device=idx.device, dtype=torch.bool), diagonal=1)
+                attn = attn.masked_fill(mask, float('-inf'))
+                attn = F.softmax(attn, dim=-1)
+                out = (attn @ v).transpose(1, 2).contiguous().view(B, T, -1)
+                x = x + block['proj'](out)
+                xn = block['norm2'](x)
+                gate = F.silu(block['mlp_gate'](xn))
+                up = block['mlp_up'](xn)
+                x = x + block['mlp_down'](gate * up)
+            logits = self.lm_head(self.norm_f(x))
+            loss = None
+            if targets is not None:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            return logits, loss
+
+    device = 'cpu'
+    tmodel = TorchNanoAGI(karl.vocab_size, n_embd=64, n_head=4, n_layer=3, ctx=64).to(device)
+    optimizer = ChuckOptimizer(tmodel.parameters(), lr=3e-4, weight_decay=0.01)
+
+    n_params = sum(p.numel() for p in tmodel.parameters())
+    print(f"  [Chuck] PyTorch model: {n_params:,} params on {device}")
+
+    ctx = 64
+    losses = []
+    t0 = time.time()
+    for step in range(steps):
+        i = random.randint(0, max(0, len(token_ids) - ctx - 2))
+        x = torch.tensor([token_ids[i:i+ctx]], dtype=torch.long, device=device)
+        y = torch.tensor([token_ids[i+1:i+ctx+1]], dtype=torch.long, device=device)
+        if x.shape[1] < ctx or y.shape[1] < ctx:
+            continue
+        _, loss = tmodel(x, y)
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(tmodel.parameters(), 1.0)
+        optimizer.step(loss=loss.item())
+        losses.append(loss.item())
+        if (step + 1) % 50 == 0:
+            avg = sum(losses[-50:]) / len(losses[-50:])
+            elapsed = time.time() - t0
+            print(f"  [Chuck] step {step+1}/{steps}  loss={avg:.2f}  "
+                  f"dampen={optimizer.dampen:.3f}  [{elapsed:.1f}s]")
+
+    if losses:
+        first = sum(losses[:10]) / min(10, len(losses))
+        last = sum(losses[-10:]) / min(10, len(losses))
+        elapsed = time.time() - t0
+        print(f"  [Chuck] Done. loss: {first:.2f} → {last:.2f} "
+              f"({(first-last)/first*100:.0f}% improvement) [{elapsed:.1f}s]")
+        print(f"  [Chuck] Karl, your weights are warm now.")
+    else:
+        print(f"  [Chuck] No training happened. Karl, feed me more.")
 
 
 def continue_phrase(prompt, karl, meta, model, max_tokens=80, temperature=0.75):
@@ -777,7 +1003,9 @@ def repl(karl, meta, model):
     print("  nanoagi REPL — talk to Karl")
     print("  type text → generate continuation")
     print("  paste large text → Karl ingests it")
-    print("  'quit' to exit, 'status' for Karl's state")
+    print("  'hunt' → Karl searches local files for food")
+    print("  'fetch <url>' → Karl hunts the internet")
+    print("  'status' → Karl's state | 'quit' → exit")
     print("=" * 60)
     print("\n  Hello! I am a helpful AGI. At least I try.")
     print("  How can I help you?\n")
@@ -797,10 +1025,27 @@ def repl(karl, meta, model):
             print(f"  [KARL] vocab={karl.vocab_size}, merges={len(karl.merges)}, "
                   f"ingested={karl.total_ingested}B, retrains={karl.retrain_count}")
             print(f"  [KARL] pending={len(karl.pending_text)}B / {karl.retrain_threshold}B until retokenization")
+            corpus_size = os.path.getsize(KARL_TXT) if os.path.exists(KARL_TXT) else 0
+            print(f"  [KARL] karl.txt: {corpus_size/1024:.1f}KB")
             if TORCH_AVAILABLE:
-                print(f"  [Chuck] awake, dampen=?, ready to train")
+                print(f"  [Chuck] awake, ready to train")
             else:
                 print(f"  [Chuck] sleeping (no PyTorch)")
+            continue
+        if user_input.strip().lower() == 'hunt':
+            print(f"  [KARL] Hunting for local text files...")
+            hunted = autoresearch(karl, KARL_TXT, min_bytes=0)
+            if hunted > 0 and karl.should_retokenize():
+                with open(KARL_TXT, 'rb') as f:
+                    full_corpus = f.read()
+                token_ids = karl.retokenize(full_corpus)
+                meta.expand_vocab(karl.vocab_size)
+                meta.build(token_ids, window=4)
+                model.init_from_metaweights(meta)
+            continue
+        if user_input.strip().lower().startswith('fetch '):
+            url = user_input.strip()[6:]
+            autoresearch_url(karl, KARL_TXT, url)
             continue
 
         # Generate response
@@ -835,8 +1080,7 @@ def repl(karl, meta, model):
             # If Chuck is awake, train
             if TORCH_AVAILABLE:
                 print(f"  [KARL] Chuck! We have new material.")
-                # TODO: PyTorch training with Chuck
-                print(f"  [Chuck] Acknowledged. Training queued.")
+                chuck_train(karl, token_ids, model, steps=200)
 
         step += 1
 
