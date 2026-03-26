@@ -1300,7 +1300,8 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None):
 
     print(f"  [Chuck] Training {steps} steps on {len(token_ids)} tokens...")
 
-    # Build PyTorch model matching NanoAGI architecture
+    # Build PyTorch model matching NanoAGI architecture EXACTLY:
+    # Content heads (nc=2) with RoPE + RRPRAM heads (nr=2) with Wr
     class _RMSNorm(nn.Module):
         def __init__(self, dim, eps=1e-5):
             super().__init__()
@@ -1309,56 +1310,127 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None):
         def forward(self, x):
             return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
+    class _Block(nn.Module):
+        def __init__(self, n_embd, n_content, n_rrpram, hd, ctx, n_layer):
+            super().__init__()
+            self.n_embd = n_embd
+            self.n_content = n_content
+            self.n_rrpram = n_rrpram
+            self.hd = hd
+            self.norm1 = _RMSNorm(n_embd)
+            # Content heads: Q, K, V
+            self.wq = nn.Linear(n_embd, n_content * hd, bias=False)
+            self.wk = nn.Linear(n_embd, n_content * hd, bias=False)
+            self.wv_content = nn.Linear(n_embd, n_content * hd, bias=False)
+            # RRPRAM heads: Wr (positional pattern) + V
+            self.wr = nn.Parameter(torch.randn(n_rrpram, n_embd, ctx) * 0.02)
+            self.wv_rrpram = nn.Linear(n_embd, n_rrpram * hd, bias=False)
+            # Output projection (combines content + rrpram = all heads)
+            self.wo = nn.Linear(n_embd, n_embd, bias=False)
+            nn.init.normal_(self.wo.weight, std=0.02 / math.sqrt(2 * n_layer))
+            # SwiGLU MLP
+            self.norm2 = _RMSNorm(n_embd)
+            self.mlp_gate = nn.Linear(n_embd, n_embd * 4, bias=False)
+            self.mlp_up = nn.Linear(n_embd, n_embd * 4, bias=False)
+            self.mlp_down = nn.Linear(n_embd * 4, n_embd, bias=False)
+            nn.init.normal_(self.mlp_down.weight, std=0.02 / math.sqrt(2 * n_layer))
+
     class TorchNanoAGI(nn.Module):
-        def __init__(self, vocab_size, n_embd=64, n_head=4, n_layer=3, ctx=64):
+        def __init__(self, vocab_size, n_embd=64, n_head=4, n_layer=3, ctx=64,
+                     n_content=2, n_rrpram=2):
             super().__init__()
             self.ctx = ctx
+            self.n_embd = n_embd
+            self.n_content = n_content
+            self.n_rrpram = n_rrpram
+            hd = n_embd // n_head
+            self.hd = hd
             self.wte = nn.Embedding(vocab_size, n_embd)
-            self.blocks = nn.ModuleList()
-            for _ in range(n_layer):
-                self.blocks.append(nn.ModuleDict({
-                    'norm1': _RMSNorm(n_embd),
-                    'attn': nn.Linear(n_embd, n_embd * 3, bias=False),
-                    'proj': nn.Linear(n_embd, n_embd, bias=False),
-                    'norm2': _RMSNorm(n_embd),
-                    'mlp_gate': nn.Linear(n_embd, n_embd * 4, bias=False),
-                    'mlp_up': nn.Linear(n_embd, n_embd * 4, bias=False),
-                    'mlp_down': nn.Linear(n_embd * 4, n_embd, bias=False),
-                }))
+            nn.init.normal_(self.wte.weight, std=0.02)
+            self.blocks = nn.ModuleList([
+                _Block(n_embd, n_content, n_rrpram, hd, ctx, n_layer)
+                for _ in range(n_layer)
+            ])
             self.norm_f = _RMSNorm(n_embd)
             self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
             self.lm_head.weight = self.wte.weight  # weight tying
+            # Init all Linear layers to match pure-Python NanoAGI (std=0.02)
+            for block in self.blocks:
+                for name, p in block.named_parameters():
+                    if p.dim() >= 2 and 'wo' not in name and 'mlp_down' not in name and 'wr' not in name:
+                        nn.init.normal_(p, std=0.02)
+            # RoPE frequency table
+            freqs = 1.0 / (10000.0 ** (torch.arange(0, hd, 2).float() / hd))
+            t = torch.arange(ctx).float()
+            angles = torch.outer(t, freqs)
+            self.register_buffer('rope_cos', angles.cos())  # [ctx, hd//2]
+            self.register_buffer('rope_sin', angles.sin())  # [ctx, hd//2]
+
+        def _apply_rope(self, x):
+            """x: [B, n_heads, T, hd] → rotated x"""
+            T = x.shape[2]
+            cos = self.rope_cos[:T].unsqueeze(0).unsqueeze(0)  # [1,1,T,hd//2]
+            sin = self.rope_sin[:T].unsqueeze(0).unsqueeze(0)
+            x1 = x[..., ::2]   # even dims
+            x2 = x[..., 1::2]  # odd dims
+            return torch.stack([x1 * cos - x2 * sin,
+                                x1 * sin + x2 * cos], dim=-1).flatten(-2)
 
         def forward(self, idx, targets=None):
             B, T = idx.shape
             x = self.wte(idx)
+            hd = self.hd
+            mask = torch.triu(torch.ones(T, T, device=idx.device,
+                              dtype=torch.bool), diagonal=1)
+
             for block in self.blocks:
-                xn = block['norm1'](x)
-                qkv = block['attn'](xn)
-                q, k, v = qkv.chunk(3, dim=-1)
-                nh = 4
-                hd = q.shape[-1] // nh
-                q = q.view(B, T, nh, hd).transpose(1, 2)
-                k = k.view(B, T, nh, hd).transpose(1, 2)
-                v = v.view(B, T, nh, hd).transpose(1, 2)
-                attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
-                mask = torch.triu(torch.ones(T, T, device=idx.device, dtype=torch.bool), diagonal=1)
-                attn = attn.masked_fill(mask, float('-inf'))
-                attn = F.softmax(attn, dim=-1)
-                out = (attn @ v).transpose(1, 2).contiguous().view(B, T, -1)
-                x = x + block['proj'](out)
-                xn = block['norm2'](x)
-                gate = F.silu(block['mlp_gate'](xn))
-                up = block['mlp_up'](xn)
-                x = x + block['mlp_down'](gate * up)
+                xn = block.norm1(x)
+                nc = block.n_content
+                nr = block.n_rrpram
+
+                # ── Content attention with RoPE ──
+                q = block.wq(xn).view(B, T, nc, hd).transpose(1, 2)
+                k = block.wk(xn).view(B, T, nc, hd).transpose(1, 2)
+                v_c = block.wv_content(xn).view(B, T, nc, hd).transpose(1, 2)
+                q = self._apply_rope(q)
+                k = self._apply_rope(k)
+                c_attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
+                c_attn = c_attn.masked_fill(mask, float('-inf'))
+                c_attn = F.softmax(c_attn, dim=-1)
+                c_out = (c_attn @ v_c).transpose(1, 2).contiguous().view(B, T, nc * hd)
+
+                # ── RRPRAM attention (x @ Wr — positional pattern recognition) ──
+                v_r = block.wv_rrpram(xn).view(B, T, nr, hd).transpose(1, 2)
+                r_outs = []
+                for h in range(nr):
+                    # wr_h: [n_embd, ctx] → score = xn @ wr_h[:, :T]
+                    r_score = xn @ block.wr[h, :, :T]  # [B, T, T]
+                    r_score = r_score.masked_fill(mask, float('-inf'))
+                    r_attn = F.softmax(r_score, dim=-1)
+                    r_out_h = r_attn @ v_r[:, h]  # [B, T, hd]
+                    r_outs.append(r_out_h)
+                r_out = torch.cat(r_outs, dim=-1)  # [B, T, nr*hd]
+
+                # Combine content + rrpram → output projection + residual
+                combined = torch.cat([c_out, r_out], dim=-1)  # [B, T, n_embd]
+                x = x + block.wo(combined)
+
+                # SwiGLU MLP
+                xn = block.norm2(x)
+                gate = F.silu(block.mlp_gate(xn))
+                up = block.mlp_up(xn)
+                x = x + block.mlp_down(gate * up)
+
             logits = self.lm_head(self.norm_f(x))
             loss = None
             if targets is not None:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                       targets.view(-1))
             return logits, loss
 
     device = 'cpu'
-    tmodel = TorchNanoAGI(karl.vocab_size, n_embd=64, n_head=4, n_layer=3, ctx=64).to(device)
+    tmodel = TorchNanoAGI(karl.vocab_size, n_embd=64, n_head=4, n_layer=3,
+                          ctx=64, n_content=2, n_rrpram=2).to(device)
     optimizer = ChuckOptimizer(tmodel.parameters(), lr=3e-4, weight_decay=0.01)
 
     n_params = sum(p.numel() for p in tmodel.parameters())
