@@ -753,7 +753,119 @@ def load_engine():
     print(f"\n[5] Seeding weights from metaweights...")
     model.init_from_metaweights(meta)
 
+    # If Chuck is here, initial training
+    if TORCH_AVAILABLE:
+        print(f"\n[6] Chuck smells PyTorch. Initial training...")
+        chuck_train(karl, token_ids, model, steps=200)
+
     return karl, meta, model
+
+
+def chuck_train(karl, token_ids, model, steps=200):
+    """
+    Chuck wakes up and trains real weights.
+    Karl called. Smells like PyTorch. Time to work.
+    """
+    if not TORCH_AVAILABLE:
+        print("  [Chuck] Can't train. No PyTorch. Go away.")
+        return
+
+    print(f"  [Chuck] Training {steps} steps on {len(token_ids)} tokens...")
+
+    # Build PyTorch model matching NanoAGI architecture
+    class _RMSNorm(nn.Module):
+        def __init__(self, dim, eps=1e-5):
+            super().__init__()
+            self.eps = eps
+            self.weight = nn.Parameter(torch.ones(dim))
+        def forward(self, x):
+            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+    class TorchNanoAGI(nn.Module):
+        def __init__(self, vocab_size, n_embd=64, n_head=4, n_layer=3, ctx=64):
+            super().__init__()
+            self.ctx = ctx
+            self.wte = nn.Embedding(vocab_size, n_embd)
+            self.blocks = nn.ModuleList()
+            for _ in range(n_layer):
+                self.blocks.append(nn.ModuleDict({
+                    'norm1': _RMSNorm(n_embd),
+                    'attn': nn.Linear(n_embd, n_embd * 3, bias=False),
+                    'proj': nn.Linear(n_embd, n_embd, bias=False),
+                    'norm2': _RMSNorm(n_embd),
+                    'mlp_gate': nn.Linear(n_embd, n_embd * 4, bias=False),
+                    'mlp_up': nn.Linear(n_embd, n_embd * 4, bias=False),
+                    'mlp_down': nn.Linear(n_embd * 4, n_embd, bias=False),
+                }))
+            self.norm_f = _RMSNorm(n_embd)
+            self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+            self.lm_head.weight = self.wte.weight  # weight tying
+
+        def forward(self, idx, targets=None):
+            B, T = idx.shape
+            x = self.wte(idx)
+            for block in self.blocks:
+                xn = block['norm1'](x)
+                qkv = block['attn'](xn)
+                q, k, v = qkv.chunk(3, dim=-1)
+                nh = 4
+                hd = q.shape[-1] // nh
+                q = q.view(B, T, nh, hd).transpose(1, 2)
+                k = k.view(B, T, nh, hd).transpose(1, 2)
+                v = v.view(B, T, nh, hd).transpose(1, 2)
+                attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
+                mask = torch.triu(torch.ones(T, T, device=idx.device, dtype=torch.bool), diagonal=1)
+                attn = attn.masked_fill(mask, float('-inf'))
+                attn = F.softmax(attn, dim=-1)
+                out = (attn @ v).transpose(1, 2).contiguous().view(B, T, -1)
+                x = x + block['proj'](out)
+                xn = block['norm2'](x)
+                gate = F.silu(block['mlp_gate'](xn))
+                up = block['mlp_up'](xn)
+                x = x + block['mlp_down'](gate * up)
+            logits = self.lm_head(self.norm_f(x))
+            loss = None
+            if targets is not None:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            return logits, loss
+
+    device = 'cpu'
+    tmodel = TorchNanoAGI(karl.vocab_size, n_embd=64, n_head=4, n_layer=3, ctx=64).to(device)
+    optimizer = ChuckOptimizer(tmodel.parameters(), lr=3e-4, weight_decay=0.01)
+
+    n_params = sum(p.numel() for p in tmodel.parameters())
+    print(f"  [Chuck] PyTorch model: {n_params:,} params on {device}")
+
+    ctx = 64
+    losses = []
+    t0 = time.time()
+    for step in range(steps):
+        i = random.randint(0, max(0, len(token_ids) - ctx - 2))
+        x = torch.tensor([token_ids[i:i+ctx]], dtype=torch.long, device=device)
+        y = torch.tensor([token_ids[i+1:i+ctx+1]], dtype=torch.long, device=device)
+        if x.shape[1] < ctx or y.shape[1] < ctx:
+            continue
+        _, loss = tmodel(x, y)
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(tmodel.parameters(), 1.0)
+        optimizer.step(loss=loss.item())
+        losses.append(loss.item())
+        if (step + 1) % 50 == 0:
+            avg = sum(losses[-50:]) / len(losses[-50:])
+            elapsed = time.time() - t0
+            print(f"  [Chuck] step {step+1}/{steps}  loss={avg:.2f}  "
+                  f"dampen={optimizer.dampen:.3f}  [{elapsed:.1f}s]")
+
+    if losses:
+        first = sum(losses[:10]) / min(10, len(losses))
+        last = sum(losses[-10:]) / min(10, len(losses))
+        elapsed = time.time() - t0
+        print(f"  [Chuck] Done. loss: {first:.2f} → {last:.2f} "
+              f"({(first-last)/first*100:.0f}% improvement) [{elapsed:.1f}s]")
+        print(f"  [Chuck] Karl, your weights are warm now.")
+    else:
+        print(f"  [Chuck] No training happened. Karl, feed me more.")
 
 
 def continue_phrase(prompt, karl, meta, model, max_tokens=80, temperature=0.75):
@@ -835,8 +947,7 @@ def repl(karl, meta, model):
             # If Chuck is awake, train
             if TORCH_AVAILABLE:
                 print(f"  [KARL] Chuck! We have new material.")
-                # TODO: PyTorch training with Chuck
-                print(f"  [Chuck] Acknowledged. Training queued.")
+                chuck_train(karl, token_ids, model, steps=200)
 
         step += 1
 
