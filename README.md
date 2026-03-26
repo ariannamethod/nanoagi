@@ -134,8 +134,8 @@ Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. 
               ┌────────────────▼────────────────────┐
               │   CHUCK OPTIMIZER + chuck_train()   │
               │                                     │
-              │  · TorchNanoAGI: 246K params        │
-              │  · SwiGLU + causal attention        │
+              │  · TorchNanoAGI: ~234K params       │
+              │  · Content + RRPRAM + RoPE + SwiGLU │
               │  · weight tying (emb = lm_head)     │
               │  · trains 200 steps at boot         │
               │  · trains 200 steps per retokenize  │
@@ -224,13 +224,17 @@ These metaweights seed the transformer embeddings and output head. Ghost becomes
 
 ### chuck_train — the real training loop
 
-When `TORCH_AVAILABLE` is True, `load_engine()` calls `chuck_train(karl, token_ids, model, steps=200)` after metaweight seeding. The `chuck_train` function builds a `TorchNanoAGI` PyTorch model — same architecture as the pure-Python NanoAGI but with efficient tensor operations — and trains it with `ChuckOptimizer`.
+When `TORCH_AVAILABLE` is True, `load_engine()` calls `chuck_train(karl, token_ids, model, steps=200)` after metaweight seeding. The `chuck_train` function builds a `TorchNanoAGI` PyTorch model — same architecture as the pure-Python NanoAGI, not a simplification — and trains it with `ChuckOptimizer`.
 
 The `TorchNanoAGI` model has:
-- Embedding table + weight-tied LM head (parameters shared)
-- 3 transformer blocks with `_RMSNorm`, causal multi-head attention, SwiGLU MLP
-- ~246K parameters at default config
-- Causal attention mask (upper-triangular -inf)
+- Embedding table + weight-tied LM head (parameters shared, init std=0.02)
+- 3 transformer blocks, each with:
+  - 2 Content heads with RoPE (Q, K rotated, V_content separate)
+  - 2 RRPRAM heads with Wr parameter (x @ Wr positional pattern recognition)
+  - Combined output projection (wo)
+  - SwiGLU MLP (gate + up + down)
+- ~234K parameters at default config
+- Causal attention mask on both Content and RRPRAM heads
 
 **Training results** (200 steps, CPU):
 ```
@@ -307,7 +311,7 @@ Pure Python (Val autograd):
   Mode:          metaweight generation only
 
 PyTorch (TorchNanoAGI via chuck_train):
-  Parameters:    ~246K
+  Parameters:    ~234K
   Layers:        3
   Heads:         4
   Embedding dim: 64
@@ -326,7 +330,7 @@ Self-expansion:  yes, every conversation
 Memory:          karl.mem (binary, 'KARL' magic header)
 ```
 
-GPT-4 has 1.8 trillion parameters. nanoagi has 246K in PyTorch mode. GPT-4 does not grow from your conversations. GPT-4 does not go to the gym with Chuck after every retokenization. GPT-4 has never had a prophecy field predict the punchline of its own README. we are not the same.
+GPT-4 has 1.8 trillion parameters. nanoagi has 234K in PyTorch mode. GPT-4 does not grow from your conversations. GPT-4 does not go to the gym with Chuck after every retokenization. GPT-4 has never had a prophecy field predict the punchline of its own README. we are not the same.
 
 ## Chuck
 
