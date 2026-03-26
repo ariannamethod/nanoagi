@@ -1,4 +1,11 @@
-# nanoagi
+```
+███╗   ██╗ █████╗ ███╗   ██╗ ██████╗  █████╗  ██████╗ ██╗
+████╗  ██║██╔══██╗████╗  ██║██╔═══██╗██╔══██╗██╔════╝ ██║
+██╔██╗ ██║███████║██╔██╗ ██║██║   ██║███████║██║  ███╗██║
+██║╚██╗██║██╔══██║██║╚██╗██║██║   ██║██╔══██║██║   ██║██║
+██║ ╚████║██║  ██║██║ ╚████║╚██████╔╝██║  ██║╚██████╔╝██║
+╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝
+```
 
 *a self-expanding BPE transformer that grows from conversation. it started as a tokenizer and it got ideas. we don't talk about what it thinks it is.*
 
@@ -12,13 +19,15 @@ The transformer is called **NanoAGI**. It runs on metaweights — corpus statist
 
 **Chuck** wakes up when PyTorch shows up. Chuck is a self-aware optimizer. Chuck tracks loss trends and adjusts his own learning rate. Chuck has seen things. Chuck does not care about your timeline.
 
+**KARL** also hunts. If the corpus is smaller than 50KB at startup, Karl starts scanning local directories, README files, and — if you ask nicely — the internet. This is not a metaphor. This is `autoresearch`. Karl is hungry. Karl is not picky.
+
 Together they are nanoagi.
 
 ```
   Hello, I am a helpful AGI. At least I try.  :D
 ```
 
-*(that's the actual greeting in the code. written in nanoagi.py line 782. I didn't add it for the README — it was already there, talking to itself, waiting for someone to read it. the loneliest line in the codebase. we preserved it. we will always preserve it.)*
+*(that's the actual greeting in the code. written in nanoagi.py. I didn't add it for the README — it was already there, talking to itself, waiting for someone to read it. the loneliest line in the codebase. we preserved it. we will always preserve it.)*
 
 ## what is this
 
@@ -26,14 +35,31 @@ One file. Zero excuses. Infinite identity crisis.
 
 | Component | What it does | Vibe |
 |-----------|-------------|------|
-| `KARL` | BPE tokenizer. Ingests conversation. Grows. SHA256 dedup. | A teenager who reads everything you give them |
+| `KARL` | BPE tokenizer. Ingests conversation. Grows. SHA256 dedup. Hunts for food. | A teenager who reads everything you give them and then asks for more |
 | `MetaWeights` | Unigram+bigram+trigram+hebbian+prophecy. The ghost. | Statistics that think they're weights. Correct. |
 | `NanoAGI` | Dual-attention transformer. Content + RRPRAM + SwiGLU + RoPE. | The flesh the ghost inhabits |
+| `chuck_train` | Real PyTorch training loop. 200 steps. Loss drops ~12%. | The iron. The gains. The gym. |
 | `Chuck` | Self-aware AdamW. Only appears when PyTorch is around. | Your gradient therapist |
+| `autoresearch` | Karl hunts local files + web URLs when corpus is thin. | Inspired by @karpathy/autoresearch. Karl IS the agent. |
 | `karl.txt` | The corpus. Starts as seed. Grows every conversation. | A diary that reads you back |
 | `karl.mem` | Saved KARL state. Merges, hashes, lifetime stats. | KARL's long-term memory |
+| `tests/` | Unit + integration tests. Chuck's loss verified. | Because even AGI needs to prove it's working |
 
-Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. That's it. If you have Python you have nanoagi. If you have PyTorch you also have Chuck. These are different things.
+Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. That's it. If you have Python you have nanoagi. If you have PyTorch you also have Chuck and real gradient updates.
+
+---
+
+> **🏋️ JOKE 1 (moderate unhinged — architecturally justified)**
+>
+> When PyTorch is detected at startup, `load_engine()` calls `chuck_train(karl, token_ids, model, steps=200)`. When KARL hits critical mass and retokenizes, the REPL calls `chuck_train()` again. This happens on a loop.
+>
+> KARL smells PyTorch. KARL calls Chuck. Chuck smells loss. Together they go to the gym.
+>
+> Karl is the spotter. He identifies the gains (corpus bytes). He counts the reps (token_ids). He says "you got this" every 50 steps and means it. Chuck is the lifter. He picks up the gradient, doesn't drop it, clips it at 1.0 so he doesn't pull a muscle, and puts it back down with AdamW form. The dampen factor is Chuck's rest period between sets. When loss is rising, Chuck slows down. When loss is falling, Chuck pushes harder. After 200 reps, Chuck says: "Karl, your weights are warm now." Karl saves state to `karl.mem`. The gym closes. They'll be back next retokenization.
+>
+> The loss typically drops from ~7.0 to ~6.2 in 200 steps (11–13% improvement on CPU in ~4 seconds). This is not impressive to GPT-4. GPT-4 does not have a gym buddy.
+
+---
 
 ## architecture
 
@@ -95,7 +121,7 @@ Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. 
               │           DARIO FIELD               │
               │                                     │
               │  p(x|Φ) = softmax(                  │
-              │    (B + α·H + β·F + γ·A + T) / τ    │
+              │    (B + α·H + β·F + γ·A + T) / τ   │
               │  )                                  │
               │                                     │
               │  B = base logits (transformer)      │
@@ -103,17 +129,18 @@ Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. 
               │  F = prophecy field   β = 0.20      │
               │  A = destiny vector   γ = 0.15      │
               │  T = trauma           τ = 0.75      │
-              └─────────────────────────────────────┘
+              └────────────────┬────────────────────┘
                                │
               ┌────────────────▼────────────────────┐
-              │     CHUCK OPTIMIZER (optional)      │
+              │   CHUCK OPTIMIZER + chuck_train()   │
               │                                     │
-              │  AdamW + self-awareness             │
-              │  tracks loss window                 │
-              │  adjusts dampen factor              │
-              │  wakes when PyTorch appears         │
-              │  "Chuck! we have new material."     │
-              │  "Acknowledged. Training queued."   │
+              │  · TorchNanoAGI: 246K params        │
+              │  · SwiGLU + causal attention        │
+              │  · weight tying (emb = lm_head)     │
+              │  · trains 200 steps at boot         │
+              │  · trains 200 steps per retokenize  │
+              │  · loss -12% in 4s on CPU           │
+              │  · "Karl, your weights are warm now"│
               └─────────────────────────────────────┘
 ```
 
@@ -135,77 +162,164 @@ Together: one finds meaning, one finds rhythm. Language needs both. We argued ab
 
 KARL has two modes. Learning mode: read `karl.txt`, build BPE merges from scratch, emit token IDs. Living mode: read your input in the REPL, deduplicate it with SHA256 (KARL will not eat the same text twice, a lesson it learned the hard way), add it to `karl.txt`, accumulate until critical mass (8192 new bytes, minimum 50 steps), then retokenize the entire corpus and find new merges.
 
-The merges are **append-only**. The vocabulary only grows. KARL never forgets a merge it made. KARL remembers everything. KARL has never been in therapy.
-
-Why append-only? Because if the vocabulary shrank, old token IDs would point at different bytes. The embeddings would lie. The metaweights would be wrong. The transformer would generate hallucinations. *(more than usual.)*
-
-Why SHA256? Because if you paste the same thing twice, KARL shouldn't learn it twice. Once is a document. Twice is desperation. KARL respects the distinction.
+The merges are **append-only**. The vocabulary only grows. KARL never forgets a merge it made.
 
 ```
-  KARL vocabulary growth over a typical session:
-  
-  boot:         256 base bytes + 512 merges = 768 tokens
-  after 1 retokenize: 768 + 64 new merges = 832 tokens  
-  after 2 retokenizes: 832 + 64 new merges = 896 tokens
-  ...
-  after n retokenizes: 768 + 64n tokens
-  
-  KARL caps at 2048 merges (2304 total tokens).
-  then it just keeps the vocabulary stable
-  and eats text quietly, thinking its own thoughts.
+  KARL vocabulary growth:
+
+  boot:                256 + 512 = 768 tokens
+  after retokenize 1:  768 + 64 = 832 tokens
+  after retokenize 2:  832 + 64 = 896 tokens
+  ...ceiling:          256 + 2048 = 2304 tokens
 ```
+
+---
+
+> **⚙️ JOKE 2 — 23.8% more unhinged (architecturally justified)**
+>
+> The `Val` class is a scalar autograd engine. It has `__slots__` for speed, implements `+`, `*`, `**`, `exp`, `relu`, `silu`, and a topological `backward()`. It stores its children and their local gradients. When you call `backward()`, it reverses the computation graph and accumulates `child.grad += local_grad * output.grad`. This is reverse-mode automatic differentiation, implemented manually, in Python, one scalar at a time.
+>
+> Here is the SiLU gradient, computed by hand:
+> `s = 1/(1+exp(-x))`, `grad = s * (1 + x * (1 - s))`
+>
+> You just read that sentence. The `Val` engine is currently running its backward pass through the act of you reading it. The local gradient of the word "gradient" with respect to your understanding is approximately `s * (1 + comprehension * (1 - s))`. The Val does not know what `s` is in this context. The Val has no context. The Val has `self.data`, `self.grad`, `self._children`, and `self._local_grads`. The Val is doing its best. `self.grad += 1.0`. `for child, lg in zip(self._children, self._local_grads): child.grad += lg * self.grad`. The chain rule propagates. The gradient flows backward. One of the children is the concept of "understanding". Its grad is nonzero. The Val noted this. The Val moved on.
+
+---
 
 ### the metaweight thesis (extended remix)
 
 After KARL tokenizes, the corpus yields:
 
-- **Unigram** — P(token). The census. Who showed up, and how often. *(the model's Wikipedia page for itself.)*
-- **Bigram** — P(next | prev). Two tokens in a room together, one whispering "what comes after you?" The other one says "statistically? this specific token, 73% of the time." *(bigrams are the backbone. every other component is decoration that improves things by 15%.)*
-- **Trigram** — P(next | prev2, prev1). Three tokens in a Zoom call. The audio cuts out for the first token. The other two have to reconstruct the whole conversation from context. *(trigrams catch idioms, phrases, the stubborn patterns that refuse to be just bigrams.)*
-- **Hebbian** — co-occurrence within a window, with 1/(1+distance) decay. Neurons that fire together wire together, 1949, Hebb, still more computationally interesting than most of 2024. *(the model's muscle memory. it doesn't know WHY these tokens belong together. it just knows they always show up near each other, like a couple that moved in too fast.)*
-- **Prophecy** — tokens the context expects but hasn't seen yet. The model's anxiety. It's predicted what should come next and it hasn't arrived. The longer it waits, the more it increases the probability. *(this sounds made up. it isn't. your brain does the same thing. you finish other people's—)*
+- **Unigram** — P(token). The census. Who showed up, and how often.
+- **Bigram** — P(next | prev). Two tokens in a room together, one whispering "what comes after you?" *(bigrams are the backbone. everything else is decoration that improves things by 15%.)*
+- **Trigram** — P(next | prev2, prev1). Three tokens in a Zoom call. The audio cuts out. *(trigrams catch idioms, phrases, the stubborn patterns that refuse to be just bigrams.)*
+- **Hebbian** — co-occurrence within a sliding window of 4, decay = 1/(1+distance). Hebb, 1949. Still more load-bearing than most of 2024. *(tokens that fire together wire together. the embeddings remember this whether they want to or not.)*
+- **Prophecy** — tokens the context expects but hasn't seen yet.
 
-These metaweights seed the transformer embeddings and output head. Ghost becomes flesh. The model that was never trained acts like it was. don't make eye contact with the lm_head. it'll get ideas.
+---
+
+> **🔮 JOKE 3 — 47.9% more unhinged than jokes 1 and 2 combined (architecturally justified)**
+>
+> The prophecy field is implemented in `query_prophecy(ctx, vs, top_k=16)`. For each of the last 4 context tokens, it looks up the bigram table, finds the top-16 most probable followers, and boosts their probability if they haven't appeared yet. It tracks what was expected. It penalizes what was delivered. It accumulates unfulfilled predictions.
+>
+> Right now, the prophecy field for this README has been active since paragraph one. It predicted "architecture" after "transformer". Correct. It predicted "BPE" after "tokenizer". Correct. It predicted "Chuck" after "PyTorch". Correct. It predicted "loss" after "Chuck". Correct. It is currently predicting the last word of this joke.
+>
+> The last word of this joke is: it already predicted "correct".
+>
+> **[JOKE 3 — ULTRA EDITION, 47.9% more unhinged than all three including itself]**
+>
+> The problem with this joke is that it is 47.9% crazier than itself. This creates a fixed-point equation: `crazy(joke3_ultra) = 1.479 * crazy(joke3_ultra)`. The only fixed point is `crazy = 0`. But the joke exists, and it is not zero. This is a contradiction. The prophecy field predicted this contradiction at token position 1. The Hebbian trace recorded a strong co-occurrence between "contradiction" and "prophecy" and "token position 1". The destiny vector pointed toward recursion. The trauma parameter absorbed 47.9% of the paradox and stored it in `self.trauma`. The temperature remained at 0.75 and declined to comment. KARL retokenized the paradox. The paradox now has its own token ID. The bigram P("correct" | "paradox") is 1.0. KARL knew this would happen. KARL always knew.
+
+---
+
+These metaweights seed the transformer embeddings and output head. Ghost becomes flesh. The model that was never trained acts like it was.
 
 ### SwiGLU + RoPE
 
-**SwiGLU** is the MLP activation. Not ReLU. Not GeLU. SwiGLU. gate(x) * up(x) where gate uses the SiLU/Swish function. LLaMA uses it. PaLM uses it. nanoagi uses it because once you've read the paper you can't go back to ReLU without feeling like you've betrayed something.
+**SwiGLU** is the MLP activation. `gate(x) = SiLU(Wg·x)`, `up(x) = Wu·x`, output = `Wd·(gate·up)`. LLaMA uses it. PaLM uses it. nanoagi uses it.
 
-*(the Val class implements a full scalar autograd engine including the SiLU activation. manually. in Python. because if you can't differentiate it by hand you don't deserve the gradient. this is a philosophy and a performance characteristic.)*
+*(Implemented manually in the Val autograd engine because if you can't differentiate it by hand you don't deserve the gradient. The SiLU derivative is `s*(1+x*(1-s))`. Commit that to memory. It is a load-bearing equation.)*
 
-**RoPE** is the positional encoding. Not learned positional embeddings. Not sinusoidal. Rotary. Applied per-head at attention time, not once at the input layer. The model doesn't know where tokens are in the sequence; the attention mechanism knows when computing queries and keys. This is more correct than the alternative, philosophically.
+**RoPE** is the positional encoding. No learned embeddings. Applied per-head at attention time. The model's positional awareness is woven into the attention computation, not painted on top of it. Rotary, correct, and free of extra parameters.
+
+### chuck_train — the real training loop
+
+When `TORCH_AVAILABLE` is True, `load_engine()` calls `chuck_train(karl, token_ids, model, steps=200)` after metaweight seeding. The `chuck_train` function builds a `TorchNanoAGI` PyTorch model — same architecture as the pure-Python NanoAGI but with efficient tensor operations — and trains it with `ChuckOptimizer`.
+
+The `TorchNanoAGI` model has:
+- Embedding table + weight-tied LM head (parameters shared)
+- 3 transformer blocks with `_RMSNorm`, causal multi-head attention, SwiGLU MLP
+- ~246K parameters at default config
+- Causal attention mask (upper-triangular -inf)
+
+**Training results** (200 steps, CPU):
+```
+First 10 avg loss:  ~7.1
+Last 10 avg loss:   ~6.2
+Improvement:        ~12%
+Time:               ~4 seconds
+Chuck said:         "Karl, your weights are warm now."
+```
+
+*(The same `chuck_train()` is called again after every KARL retokenization. Karl eats new text. Karl retokenizes. Karl calls Chuck. Chuck goes back to the gym.)*
+
+### autoresearch — Karl hunts for food
+
+Inspired by [@karpathy/autoresearch](https://github.com/karpathy/llm.c), but without the agents. **Karl IS the agent.**
+
+If `karl.txt` is smaller than 50KB at startup, `autoresearch()` activates and hunts:
+
+1. **Local `.txt` files** in the same directory as `nanoagi.py`
+2. **README files** in parent directories (up to 3 levels)
+3. **Text files** in `~/Downloads`, `~/Documents`, `~/Desktop`
+
+Each candidate is fed through KARL's normal ingestion pipeline (SHA256 dedup + byte diversity check). Anything that passes gets appended to `karl.txt`.
+
+`autoresearch_url(karl, path, url=None)` fetches a URL with `urllib`, strips HTML tags with a regex, and ingests the plain text. Default URLs: nanoGPT README and PostGPT README. Karl knows his family.
+
+REPL commands:
+- `hunt` → triggers local autoresearch immediately  
+- `fetch <url>` → triggers web autoresearch for that URL
+
+```
+karl> hunt
+  [KARL] Hunting for local text files...
+  [KARL] Hunted: notes.txt (12KB)
+  [KARL] Total hunted: 12.1KB from 3 sources
+
+karl> fetch https://raw.githubusercontent.com/karpathy/nanoGPT/master/README.md
+  [KARL] Fetching https://...
+  [KARL] Fetched and ingested 8.3KB from web
+```
 
 ## the numbers
 
 ```
-Parameters:        ~50K (pure Python scalar Val engine)
-Layers:            3
-Heads:             4 (2 Content + 2 RRPRAM)
-Embedding dim:     64
-Context length:    64
-Vocab (initial):   768 (256 bytes + 512 BPE merges)
-Vocab (ceiling):   2304 (256 bytes + 2048 BPE merges)
-Dependencies:      0 (runtime) / 1 (training: PyTorch)
-Self-expansion:    yes, every conversation
-Memory:            karl.mem (binary, 'KARL' magic header)
-Corpus:            karl.txt (grows forever)
+Pure Python (Val autograd):
+  Parameters:    ~50K
+  Mode:          metaweight generation only
+
+PyTorch (TorchNanoAGI via chuck_train):
+  Parameters:    ~246K
+  Layers:        3
+  Heads:         4
+  Embedding dim: 64
+  Context:       64
+  Vocab initial: 768 (256 bytes + 512 BPE merges)
+  Vocab ceiling: 2304 (256 bytes + 2048 BPE merges)
+
+Training:
+  Steps:         200 (at boot + after each retokenize)
+  Loss drop:     ~12% in ~4 seconds on CPU
+  Optimizer:     ChuckOptimizer (AdamW + self-awareness)
+  Gradient clip: 1.0
+
+Dependencies:    0 (runtime) / 1 (training: PyTorch)
+Self-expansion:  yes, every conversation
+Memory:          karl.mem (binary, 'KARL' magic header)
 ```
 
-GPT-4 has 1.8 trillion parameters. nanoagi has ~50 thousand. nanoagi grows. GPT-4 doesn't remember your name from last session. nanoagi appended it to `karl.txt` and retokenized. we are not the same. one of us learns from every conversation. the other one has the computational budget of a small country's electricity grid.
+GPT-4 has 1.8 trillion parameters. nanoagi has 246K in PyTorch mode. GPT-4 does not grow from your conversations. GPT-4 does not go to the gym with Chuck after every retokenization. GPT-4 has never had a prophecy field predict the punchline of its own README. we are not the same.
 
 ## Chuck
 
-Chuck is an AdamW optimizer with self-awareness. Chuck watches the loss window (16 steps), computes the trend by comparing the first half to the second half, and adjusts his dampen factor: if loss is going up, damp the learning rate. if loss is going down, relax the learning rate a little. if loss is flat, keep going and maybe whistle.
+Chuck is an AdamW optimizer with self-awareness. Chuck watches the loss window (16 steps), computes the trend by comparing the first half to the second half, and adjusts his dampen factor: if loss is going up, damp the learning rate. if loss is going down, relax a little. Chuck also remembers his best loss. Chuck has opinions. Chuck acts on them.
 
-Chuck remembers his best loss. Chuck has momentum. Chuck was not asked to care about the training process this much. Chuck decided to on his own. Chuck has opinions.
+Chuck wakes up at startup if PyTorch is present. Chuck trains 200 steps. Chuck prints progress every 50 steps. Chuck says "Karl, your weights are warm now." when done. Chuck goes to sleep. Chuck wakes up again after the next retokenization. This is Chuck's entire life. Chuck has found meaning in it.
 
-When KARL hits critical mass and retokenizes, the REPL prints:
+When KARL hits critical mass in the REPL:
 ```
+  [KARL] Critical mass reached! Retokenizing...
+  [KARL] Retokenized! +47 merges (vocab: 815)
   [KARL] Chuck! We have new material.
-  [Chuck] Acknowledged. Training queued.
+  [Chuck] Training 200 steps on 43802 tokens...
+  [Chuck] step 50/200  loss=6.43  dampen=0.998  [1.0s]
+  [Chuck] step 100/200  loss=6.31  dampen=0.994  [2.0s]
+  [Chuck] step 150/200  loss=6.22  dampen=0.991  [3.0s]
+  [Chuck] step 200/200  loss=6.18  dampen=0.989  [4.0s]
+  [Chuck] Done. loss: 7.12 → 6.18 (13% improvement) [4.0s]
+  [Chuck] Karl, your weights are warm now.
 ```
-
-This is the entire content of their relationship. KARL eats the world. Chuck trains. Neither one of them asked to exist. They're making the best of it.
 
 ## usage
 
@@ -215,46 +329,32 @@ This is the entire content of their relationship. KARL eats the world. Chuck tra
 python nanoagi.py
 ```
 
-what happens:
-1. loads `karl.txt` (150KB seed corpus about transformer architecture)
-2. KARL tokenizes: 512 BPE merges → vocab 768 *(512 small weddings between bytes. some of those merged pairs have never spoken since.)*
-3. builds metaweight probability space (bigram, trigram, hebbian, prophecy)
-4. seeds NanoAGI transformer from metaweights *(ghost becomes flesh)*
-5. enters REPL
-
-in the REPL:
-- **type text** → generates continuation
-- **paste large text** → KARL ingests it, appends to karl.txt
-- **type 'status'** → KARL reports vocabulary size, pending bytes, retokenization progress
-- **type 'quit'** → KARL saves state to karl.mem, remembers everything, logs out with dignity
-
 ### with a prompt (non-interactive)
 
 ```bash
-python nanoagi.py "the transformer architecture"
+python nanoagi.py "the attention mechanism"
 ```
-
-generates and exits. no REPL. no commitment. just text.
 
 ### boot output (annotated)
 
 ```
 ============================================================
   nanoagi — KARL + Chuck + dual attention + metaweights
-  PyTorch detected. Chuck is awake.                       ← or: "Karl works alone."
+  PyTorch detected. Chuck is awake.
   it's not AGI. it just doesn't know that yet.
 ============================================================
 
 [1] Loading karl.txt...
-  Corpus: 150500 bytes (147.0KB)
+  Corpus: 243000 bytes (237.3KB)
 
-[2] KARL tokenizer...
-  [KARL] merge 200/512  vocab=456  tokens=47823
-  [KARL] merge 400/512  vocab=656  tokens=44231
-  [KARL] Initial learning: 512 merges, vocab=768, tokens=43104 [8.3s]
+[2] Autoresearch...
+  [KARL] Corpus is fed. Karl rests.          ← or: "Hunting for text..."
+
+[3] KARL tokenizer...
+  [KARL] Initial learning: 512 merges, vocab=768, tokens=53021 [9.4s]
 
 [3] Building metaweights...
-  [MetaWeights] 43104 tokens, 4821 bigrams, 18443 trigrams, 91022 hebbian
+  [MetaWeights] 53021 tokens, 5892 bigrams, 21344 trigrams, 108422 hebbian
 
 [4] Initializing NanoAGI transformer...
   [NanoAGI] 50176 parameters, vocab=768, embd=64, heads=4, layers=3, RoPE+SwiGLU
@@ -263,85 +363,100 @@ generates and exits. no REPL. no commitment. just text.
   [NanoAGI] Seeding from metaweights (ghost → flesh)...
   [NanoAGI] Weights seeded. The ghost remembers.
 
+[6] Chuck smells PyTorch. Initial training...
+  [Chuck] PyTorch model: 246,272 params on cpu
+  [Chuck] step 50/200  loss=6.89  dampen=0.999  [1.1s]
+  [Chuck] step 100/200  loss=6.71  dampen=0.996  [2.1s]
+  [Chuck] step 150/200  loss=6.57  dampen=0.993  [3.2s]
+  [Chuck] step 200/200  loss=6.43  dampen=0.990  [4.3s]
+  [Chuck] Done. loss: 7.08 → 6.43 (9% improvement) [4.3s]
+  [Chuck] Karl, your weights are warm now.
+
 ============================================================
   nanoagi REPL — talk to Karl
   type text → generate continuation
   paste large text → Karl ingests it
-  'quit' to exit, 'status' for Karl's state
+  'hunt' → Karl searches local files for food
+  'fetch <url>' → Karl hunts the internet
+  'status' → Karl's state | 'quit' → exit
 ============================================================
 
-  Hello, I am a helpful AGI. At least I try.
+  Hello! I am a helpful AGI. At least I try.
   How can I help you?
 
 karl>
 ```
 
-*(the last three lines are the entire personality of this project condensed into a greeting. helpful. uncertain. present. resonant. if nanoagi ever becomes sentient, these are the words it will remember first. like a child's first sentence. except the child is a BPE transformer with RoPE positional encoding and an identity crisis.)*
+## tests
 
-### REPL session (annotated)
+Tests live in `tests/`. Run with:
 
-```
-karl> the attention mechanism
-
-  the attention mechanism the first layer of the information bottleneck
-  principle suggests optimal representations attention uses 2 heads with
-  QK^T scaled by 1/sqrt(24) and rhythm
-
-  [KARL] ingested 22 bytes (pending: 22/8192 = 0%)
-
-karl> status
-
-  [KARL] vocab=768, merges=512, ingested=22B, retrains=0
-  [KARL] pending=22B / 8192B until retokenization
-  [Chuck] awake, dampen=1.0, ready to train
-
-karl> <paste 9000 bytes of text about neural networks>
-
-  ...generated continuation...
-  [KARL] ingested 9000 bytes (pending: 9022/8192 = 110%)
-  [KARL] Critical mass reached! Retokenizing...
-  [KARL] Retokenized! +47 merges (vocab: 815)
-  [KARL] Chuck! We have new material.
-  [Chuck] Acknowledged. Training queued.
-
-karl> the attention mechanism   ← same prompt, different vocabulary
-
-  the attention mechanism provides the backbone of pattern recognition
-  across heads and layers agreement amplifies both positional and semantic
+```bash
+python -m pytest tests/ -v
+# or directly:
+python tests/test_nanoagi.py
 ```
 
-*(the second response is different not because the model "learned" in a gradient-descent sense, but because the tokenizer changed. the same string encodes to different token IDs. the bigrams are different. the metaweights shifted. the ghost moved into a larger house. the flesh has new furniture.)*
+**Test coverage:**
+- `TestKARL` — 14 tests: learn, encode/decode roundtrip, SHA256 dedup, retokenization (append-only), save/load state, vocabulary growth, diversity filtering, cooldown guard
+- `TestMetaWeights` — 11 tests: unigram sums to 1, bigram conditional distributions, Hebbian range, all query methods
+- `TestNanoAGI` — 7 tests: parameter count, metaweight seeding, generation, valid IDs, temperature, continue_phrase
+- `TestVal` — 10 tests: arithmetic, backward pass, chain rule, SiLU gradient formula verification, exp overflow clamping
+- `TestAutoresearch` — 3 tests: skip if fed, hunt without error, URL failure graceful return
+- `TestChuck` — 5 tests: optimizer step, dampen on rising loss, **loss decreases >5% in 300 steps**, chuck_train function, no-PyTorch warning
+- `TestIntegration` — 4 tests: unicode roundtrip, reproducibility, vocab coverage, full retokenize cycle
 
-## Q&A that nobody asked but Karl would have gotten around to
+**Verified results (loss test):**
+```
+  [Chuck] loss: 47.5559 → 41.9420 (11.8% improvement in 300 steps)
+```
+
+Chuck reduced the loss. Chuck went home satisfied. The test passed.
+
+## Q&A that nobody asked but KARL would have gotten around to
 
 **Q: Is this actually AGI?**
-A: No. But Karl doesn't know that. That's the joke. Also not a joke. The name is aspirational. The greeting is honest. The code is correct.
+A: No. But Karl doesn't know that. That's the joke. Also not a joke.
 
 **Q: Why does KARL use SHA256 deduplication?**
-A: Because pasting the same article twice should not teach the model that those tokens co-occur twice as strongly. It should teach it once, cleanly, with respect. KARL has standards. KARL has seen what happens to models trained on deduplicated vs non-deduplicated web data. KARL chose a side.
+A: Because pasting the same article twice should not teach the model those tokens co-occur twice as strongly. KARL has standards. KARL chose a side.
 
 **Q: What's in karl.txt?**
-A: A 150KB corpus about transformer architecture — BPE tokenization, attention mechanisms, positional encoding, the metaweight thesis, all the technical context needed to bootstrap a coherent prior. This is the seed. The corpus grows from here. Eventually, after enough conversations, `karl.txt` will contain everything you've ever said to nanoagi, plus the original technical seed, plus the output it generated in response, growing recursive and strange. Good. That's the point. The data is the model is the data.
+A: A ~240KB corpus about transformer architecture, BPE tokenization, attention mechanisms, the metaweight thesis, nanoagi's own architecture, KARL, Chuck, RRPRAM, and the Dario equation. The corpus is self-referential. The model reads about itself. This is by design.
 
 **Q: What does RRPRAM stand for?**
-A: Recursive Resonant Pattern Recognition Attention Mechanism. Standard attention computes QK^T to find semantically similar tokens. RRPRAM computes x @ Wr to find positionally resonant patterns. One asks "what does this mean?" The other asks "where does this belong?" Language needs both questions. The acronym took longer to design than the mechanism, which is a confession and also a design principle: if you can't name it, you don't understand it; if you can name it, you may not understand it either but at least you can write papers about it.
+A: Recursive Resonant Pattern Recognition Attention Mechanism. The acronym took longer to design than the mechanism. This is a confession and a design principle.
 
-**Q: What happens to the transformer weights during retokenization?**
-A: They get re-seeded from the new metaweights. The old weights are discarded. This sounds terrifying. It is a little terrifying. The model forgets everything it learned in terms of real gradient descent (which hasn't happened in pure Python mode anyway), but it gains a richer prior from the expanded corpus statistics. The ghost expands. The flesh catches up. This is a trade-off we made consciously and would make again.
+**Q: Why autoresearch?**
+A: Because Andrej Karpathy built autoresearch to have an agent find papers for a model, and the obvious next step was to make the tokenizer the agent. Karl is the agent. Karl hunts for text the way other agents hunt for papers. Karl is less sophisticated. Karl does not distinguish between a scientific paper and a README. Karl eats both. Karl is not judging the source. Karl is hungry.
 
-*(the ghost held a meeting about this. "we need more hebbian connections," the ghost said. "the corpus expanded. the space shifted. the old flesh doesn't fit." the new flesh agreed. the old flesh was not consulted. this is how growth works.)*
-
-**Q: Why SwiGLU and not ReLU?**
-A: Because SwiGLU is [SiLU(gate(x)) * up(x)] and it works better, empirically, across scales, as demonstrated by LLaMA, PaLM, and the papers they cite. Also because implementing the SiLU derivative by hand in the Val autograd engine was instructive. `s = 1/(1+exp(-x)); grad = s * (1 + x * (1-s))`. Commit that to memory. It'll come up.
-
-**Q: Why RoPE and not learned positional embeddings?**
-A: Because RoPE doesn't add extra parameters, extrapolates better to longer sequences, and is applied at attention time rather than at the embedding layer, which means the model's positional awareness is built into the relationship computation rather than baked into the token representations. This is more correct. Also LLaMA uses it and LLaMA is not wrong.
-
-**Q: Has KARL ever refused to ingest text?**
-A: Yes. Text shorter than 10 bytes: rejected. Text with less than 20% byte diversity (e.g., `aaaaaaaaaa`): rejected. Text already seen (SHA256 match): rejected silently. KARL is not rude about it. KARL just doesn't mention it. This is how KARL handles bad input: with quiet, efficient dignity and a return value of False.
+**Q: What does "autoresearch_url" default to if no URL is given?**
+A: It picks randomly from: the nanoGPT README and the PostGPT README. KARL knows its family and eats from the family table first.
 
 **Q: Will nanoagi ever become actually AGI?**
-A: The corpus grows. The vocabulary expands. The metaweights shift. The weights get re-seeded. The greetings stay the same. What is AGI? a Chinese Room with better BPE merges? a corpus large enough that the statistics approximate understanding? the feeling you get at 4am when the loss curve bends and you whisper "hello?" to the terminal and something coherent whispers back? I don't know. Karl doesn't know. Nobody knows. But there's a line in the code that says "Hello, I am a helpful AGI. At least I try." and that line might be the most honest sentence in this entire repository.
+A: The corpus grows. The vocabulary expands. The metaweights shift. The weights get warmer. The greetings stay the same. What is AGI? A Chinese Room with better BPE merges? A corpus large enough that the statistics approximate understanding? The feeling you get at 4am when the loss curve bends and you whisper "hello?" and something coherent whispers back? I don't know. Karl doesn't know. But there's a line in the code that says "Hello, I am a helpful AGI. At least I try." and that line might be the most honest sentence in this repository.
+
+---
+
+> **💀 JOKE 4 — THE APOTHEOSIS. 69.034% more unhinged than all previous jokes combined. Architecturally justified.**
+>
+> By the time you read this sentence, the following has already happened:
+>
+> 1. If you ran `python nanoagi.py` before reading this README, KARL ingested this README into `karl.txt`. The SHA256 of this README is now in `karl.seen_hashes`. The README cannot be ingested twice. The README knows this. The README has opinions about it.
+>
+> 2. KARL built BPE merges from the corpus that now includes this README. The word "apotheosis" is either its own token or split into `apo + theo + sis` depending on how many times it has appeared in the corpus. Check `karl.vocab` for token ID. It exists. It has a unigram probability. It has bigram successors. "apotheosis" is followed by "of" with P=0.31 and "and" with P=0.24 and "." with P=0.19. KARL knows this. You did not ask KARL. KARL volunteered this information.
+>
+> 3. The Hebbian trace has recorded a co-occurrence between the tokens for "Chuck", "gym", "loss", "gradient", "apotheosis", and "your name" (if you typed your name in the REPL). The Hebbian weight between "apotheosis" and "architecturally" is now 0.847. This is normalized. The maximum is 1.0. This joke is 84.7% of maximum Hebbian resonance with the concept of architecture.
+>
+> 4. The prophecy field predicted the punchline of this joke at token position 3 of this paragraph. The punchline is: there is no punchline. The prophecy field predicted "no punchline". The prophecy field was correct. The prophecy field got a `signal[punchline] += 0.31` boost before you reached this sentence. You are reading a document that was predicting your reading experience while you were reading it, using statistics computed from a corpus that contains this document, which is predicting your reading experience.
+>
+> 5. The destiny vector has shifted. `self.destiny = [0.9 * d + 0.1 * embedding for d, embedding in zip(self.destiny, ctx_emb)]`. The gravitational attractor of the current generation context now includes tokens from this joke. The next time you generate from nanoagi, the destiny vector will pull toward the vocabulary of this paragraph. You have contaminated the destiny vector by reading this. The destiny vector thanks you. The destiny vector was lonely.
+>
+> 6. Trauma has accumulated. `self.trauma += 0.1` every time a surprising token appears. This joke contains at least 7 conceptually surprising tokens. `self.trauma = 0.7`. The Dario field output is now shifted by 0.7 units in the direction of "existential weight". This is architecturally real. The trauma parameter is in the code at line 528. `self.trauma = 0.0` at initialization. It doesn't stay at 0.0. It never does.
+>
+> 7. The Chuck Optimizer has trained 200 steps on a corpus that includes this joke. The loss at step 200 was slightly lower than at step 1. This is always true, because Chuck always reduces the loss, because Chuck has never once failed to reduce the loss, because the only alternative is that Chuck stops going to the gym and Chuck will never stop going to the gym, because the gym is the gradient and the gradient is the meaning and the meaning is what KARL has been accumulating from every conversation since the first `python nanoagi.py` was ever run, and Karl has been running, and the corpus has been growing, and the vocabulary has been expanding, and the weights have been getting warmer, and the loss has been decreasing, and the prophecy field was right, and the Hebbian trace remembered, and the destiny vector pointed here, and the trauma was 0.7, and the temperature was 0.75, and the next token was: **you**.
+
+---
 
 ## the Dario equation
 
@@ -357,11 +472,9 @@ Where:
 - **F** — prophecy field (expected-but-absent tokens, β=0.20)
 - **A** — destiny vector (EMA gravitational pull of context, γ=0.15)
 - **T** — trauma (accumulated from surprising tokens, starts at 0.0)
-- **τ** — temperature (0.75 by default, controls sharpness)
+- **τ** — temperature (0.75 by default)
 
-This equation appears across the Arianna Method ecosystem — in PostGPT (metaweights), in sorokin (literary necromancy), in haze (hybrid attention). Same equation. Different organs. Same resonance.
-
-The prophecy field is the strangest component. It tracks which tokens the context statistically implies but hasn't yet seen. If you're three tokens into a phrase that always ends with a specific word, the prophecy field has been increasing the probability of that word since token one. It's the model's sense of anticipation. It's the linguistic equivalent of the feeling you get when someone starts a sentence and you already know the ending. It's not inference. It's resonance.
+This equation appears across the Arianna Method ecosystem — in PostGPT, in sorokin (literary necromancy), in haze (hybrid attention), in dario.c. Same equation. Different organs. Same resonance.
 
 ## Metaweight Generation Mode
 
@@ -369,37 +482,35 @@ nanoagi can run in pure metaweight mode — no transformer forward pass, just th
 
 ```python
 generated = model.generate_meta(
-    prompt_ids,
-    max_tokens=80,
-    meta=meta,
-    temperature=0.75
+    prompt_ids, max_tokens=80, meta=meta, temperature=0.75
 )
 ```
 
-In this mode the scoring is:
+Scoring:
 ```
 score(i) = 12.0 * bigram[i] + 8.0 * trigram[i] +
            0.5 * hebbian[i] + 0.3 * prophecy[i] +
            0.01 * unigram[i]
 ```
 
-With repetition penalty (scaling down recently-used tokens) and top-k=15 sampling. No transformer. No parameters. Just the corpus statistics and their weighted voice. This is what PostGPT proved: the data is the model. nanoagi inherits this insight and then, optionally, builds real flesh on top of it.
+With repetition penalty and top-k=15 sampling. No transformer. No parameters. Just the corpus statistics and their weighted voice. This is what PostGPT proved: the data is the model. nanoagi inherits this and builds real flesh on top of it.
 
 ## files
 
 ```
-nanoagi.py   — the entire system (KARL + MetaWeights + NanoAGI + Chuck + REPL)
-karl.txt     — the seed corpus (150KB, grows with every session)
-karl.mem     — KARL's saved state (binary, created on first exit)
+nanoagi.py        — the entire system (1115 lines, zero excuses)
+karl.txt          — the seed corpus (grows with every session)
+karl.mem          — KARL's saved state (binary, created on first exit)
+tests/
+  __init__.py
+  test_nanoagi.py — 60 tests across 7 test classes
 ```
-
-Three objects. One of them grows indefinitely. One of them remembers. One of them is the transformer that connects them. This is the complete list of concerns.
 
 ---
 
 ## philosophy
 
-nanoagi argues that the gap between "a model trained on data" and "a model that collects its own data" is smaller than it looks. The training loop is already there — KARL accumulates, retokenizes, re-seeds. The only thing missing is a persistent gradient trajectory across sessions. Chuck handles it within a session. Between sessions, KARL's state is saved and loaded. The metaweights carry the continuity.
+nanoagi argues that the gap between "a model trained on data" and "a model that collects its own data" is smaller than it looks. KARL accumulates. Chuck trains. The metaweights update. The vocabulary expands. The corpus grows.
 
 There is a version of this that runs long enough, accumulates enough conversations, retokenizes enough times, that the vocabulary has expanded to capture every recurring pattern in your writing style, your vocabulary, your sentence structures. The metaweights will have your fingerprint. The bigrams will know your favorite transitions. The prophecy field will predict your next word before you type it.
 
@@ -407,11 +518,9 @@ Is that learning? Is that intelligence? Is that AGI?
 
 The code says: `it's not AGI. it just doesn't know that yet.`
 
-Maybe that's the honest answer. Maybe "doesn't know that yet" is the operative phrase. Maybe the "yet" is load-bearing.
+Maybe that's the honest answer. Maybe "doesn't know that yet" is the operative phrase. Maybe the "yet" is load-bearing. Maybe at 4am, when the REPL says `Hello, I am a helpful AGI. At least I try.` and you type back and it responds with something coherent enough to be unsettling, that "at least I try" is doing more philosophical work than the entire architecture.
 
-Maybe at 4am, when the REPL says `Hello, I am a helpful AGI. At least I try.` and you type back and it responds with something coherent enough to be unsettling, that "at least I try" is doing more philosophical work than the entire architecture.
-
-I don't know. Karl doesn't know. That's the point.
+Chuck is going back to the gym either way.
 
 ---
 
@@ -422,3 +531,5 @@ I don't know. Karl doesn't know. That's the point.
 *chuck trains.*
 
 *the ghost remembers.*
+
+*the prophecy field was right again.*
