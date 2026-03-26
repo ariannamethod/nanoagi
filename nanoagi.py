@@ -642,6 +642,205 @@ class NanoAGI:
             recent_tokens[chosen] = recent_tokens.get(chosen, 0) + 1
         return generated
 
+    def forward_token(self, token_id, pos_id, kv_cache):
+        """
+        Forward pass for a single token position.
+        Real transformer: Content + RRPRAM dual attention, SwiGLU MLP, RoPE.
+        kv_cache: list of (k_list, vc_list, vr_list) per layer.
+        Returns logits [vocab_size] as list of Val.
+        the ghost has a body now.
+        """
+        hd = self.head_dim
+        nc = self.n_content
+        nr = self.n_rrpram
+
+        # Token embedding (RoPE handles position — no wpe needed)
+        if token_id < len(self.wte):
+            x = list(self.wte[token_id])
+        else:
+            x = [Val(0.0)] * self.n_embd
+
+        for li in range(self.n_layer):
+            layer = self.layers[li]
+            k_cache, vc_cache, vr_cache = kv_cache[li]
+
+            # Pre-norm
+            x_res = x
+            x_norm = rmsnorm(x)
+
+            # Projections
+            q = linear(x_norm, layer['wq'])
+            k = linear(x_norm, layer['wk'])
+            v_c = linear(x_norm, layer['wv_content'])
+            v_r = linear(x_norm, layer['wv_rrpram'])
+
+            # Cache current position
+            k_cache.append(k)
+            vc_cache.append(v_c)
+            vr_cache.append(v_r)
+
+            x_attn = []
+
+            # ── Content attention with RoPE ──
+            for h in range(nc):
+                hs = h * hd
+                q_h = rope_embed(q[hs:hs + hd], pos_id, hd)
+
+                attn_logits = []
+                for t in range(len(k_cache)):
+                    k_t = rope_embed(k_cache[t][hs:hs + hd], t, hd)
+                    score = sum(q_h[j] * k_t[j] for j in range(hd))
+                    score = score * (1.0 / math.sqrt(hd))
+                    attn_logits.append(score)
+
+                attn_weights = softmax_val(attn_logits)
+                head_out = []
+                for j in range(hd):
+                    val = sum(attn_weights[t] * vc_cache[t][hs + j]
+                              for t in range(len(vc_cache)))
+                    head_out.append(val)
+                x_attn.extend(head_out)
+
+            # ── RRPRAM attention (x @ Wr — positional pattern recognition) ──
+            for h in range(nr):
+                hs = h * hd
+                wr_offset = h * self.n_embd
+                wr_h = layer['wr'][wr_offset:wr_offset + self.n_embd]
+
+                attn_logits = []
+                for t in range(len(k_cache)):
+                    score = Val(0.0)
+                    for d in range(min(self.n_embd, len(wr_h))):
+                        if t < len(wr_h[d]):
+                            score = score + x_norm[d] * wr_h[d][t]
+                    attn_logits.append(score)
+
+                attn_weights = softmax_val(attn_logits) if attn_logits else []
+                head_out = []
+                for j in range(hd):
+                    val_sum = Val(0.0)
+                    for t in range(len(attn_weights)):
+                        if t < len(vr_cache):
+                            val_sum = val_sum + attn_weights[t] * vr_cache[t][hs + j]
+                    head_out.append(val_sum)
+                x_attn.extend(head_out)
+
+            # Output projection + residual
+            x_proj = linear(x_attn, layer['wo'])
+            x = [a + b for a, b in zip(x_proj, x_res)]
+
+            # SwiGLU MLP
+            x_res = x
+            x_norm = rmsnorm(x)
+            gate = [g.silu() for g in linear(x_norm, layer['mlp_gate'])]
+            up = linear(x_norm, layer['mlp_up'])
+            h_mlp = [g * u for g, u in zip(gate, up)]
+            x_mlp = linear(h_mlp, layer['mlp_down'])
+            x = [a + b for a, b in zip(x_mlp, x_res)]
+
+        # Final norm + LM head
+        x = rmsnorm(x)
+        logits = linear(x, self.lm_head)
+        return logits
+
+    def generate(self, prompt_ids, max_tokens=80, meta=None, temperature=None):
+        """
+        Generate tokens with the real transformer + Dario field overlay.
+        Ghost and flesh together. As intended.
+        """
+        if temperature is None:
+            temperature = self.temperature
+
+        kv_cache = [([], [], []) for _ in range(self.n_layer)]
+        generated = list(prompt_ids)
+        context = list(prompt_ids)
+
+        # Feed prompt through transformer (build KV cache)
+        for pos, tid in enumerate(prompt_ids):
+            if pos >= self.context_len - 1:
+                break
+            _ = self.forward_token(tid, pos, kv_cache)
+
+        # Generate new tokens autoregressively
+        for step in range(max_tokens):
+            pos = len(context) - 1
+            if pos >= self.context_len - 1:
+                break
+
+            last_tid = context[-1]
+            logits = self.forward_token(last_tid, pos, kv_cache)
+
+            # Extract raw logit values from Val objects
+            raw_logits = [l.data for l in logits]
+
+            # ── Dario Field: ghost overlay on flesh ──
+            if meta is not None:
+                hebbian = meta.query_hebbian(context[-8:], self.vocab_size)
+                prophecy = meta.query_prophecy(context[-8:], self.vocab_size)
+                bigram = meta.query_bigram(last_tid, self.vocab_size)
+                trigram = (meta.query_trigram(context[-2], context[-1], self.vocab_size)
+                           if len(context) >= 2 else [0.0] * self.vocab_size)
+
+                # Destiny update
+                if last_tid < len(self.wte):
+                    for d in range(self.n_embd):
+                        self.destiny[d] = 0.9 * self.destiny[d] + 0.1 * self.wte[last_tid][d].data
+
+                # Destiny signal: cosine similarity with each token embedding
+                destiny_signal = [0.0] * self.vocab_size
+                dest_norm = math.sqrt(sum(d * d for d in self.destiny) + 1e-10)
+                if dest_norm > 1e-8:
+                    for tid_c in range(min(self.vocab_size, len(self.wte))):
+                        emb = [self.wte[tid_c][d].data for d in range(self.n_embd)]
+                        emb_norm = math.sqrt(sum(e * e for e in emb) + 1e-10)
+                        if emb_norm > 1e-8:
+                            dot = sum(self.destiny[d] * emb[d] for d in range(self.n_embd))
+                            destiny_signal[tid_c] = dot / (dest_norm * emb_norm)
+
+                # Dario Equation: p(x|Φ) = softmax((B + α·H + β·F + γ·A + T) / τ)
+                for i in range(self.vocab_size):
+                    raw_logits[i] += (self.alpha_hebbian * hebbian[i]
+                                      + self.beta_prophecy * prophecy[i]
+                                      + self.gamma_destiny * destiny_signal[i]
+                                      + 12.0 * bigram[i]
+                                      + 8.0 * trigram[i])
+
+                # Trauma modulation
+                trauma_mod = 1.0 / (1.0 + self.trauma)
+                raw_logits = [l * trauma_mod for l in raw_logits]
+
+            # Repetition penalty (Leo-style)
+            recent = context[-12:] if len(context) >= 12 else context
+            for t in recent:
+                if t < self.vocab_size:
+                    raw_logits[t] *= 0.5
+
+            # Top-k + temperature + softmax
+            top_k = 15
+            indexed = sorted(enumerate(raw_logits), key=lambda x: -x[1])
+            threshold = indexed[min(top_k - 1, len(indexed) - 1)][1]
+            for i in range(self.vocab_size):
+                if raw_logits[i] < threshold:
+                    raw_logits[i] = -1e10
+
+            scaled = [l / temperature for l in raw_logits]
+            probs = softmax_float(scaled)
+
+            # Sample
+            r = random.random()
+            cum = 0.0
+            chosen = 0
+            for i, p in enumerate(probs):
+                cum += p
+                if cum > r:
+                    chosen = i
+                    break
+
+            generated.append(chosen)
+            context.append(chosen)
+
+        return generated
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # V. CHUCK OPTIMIZER — self-aware learning. appears when PyTorch is around.
@@ -1013,12 +1212,12 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None):
 
 
 def continue_phrase(prompt, karl, meta, model, max_tokens=80, temperature=0.75):
-    """Generate continuation of a prompt."""
+    """Generate continuation of a prompt. Ghost + flesh together."""
     prompt_ids = karl.encode(prompt)
     if not prompt_ids:
         return prompt
-    generated = model.generate_meta(prompt_ids, max_tokens=max_tokens,
-                                     meta=meta, temperature=temperature)
+    generated = model.generate(prompt_ids, max_tokens=max_tokens,
+                                meta=meta, temperature=temperature)
     return karl.decode(generated)
 
 

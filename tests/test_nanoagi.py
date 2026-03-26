@@ -359,6 +359,42 @@ class TestNanoAGI(unittest.TestCase):
         result = self.model.generate_meta(prompt, max_tokens=10, meta=None)
         self.assertEqual(result, prompt)
 
+    def test_forward_token_returns_logits(self):
+        """Real transformer forward pass returns vocab-sized logits."""
+        self.model.init_from_metaweights(self.meta)
+        kv_cache = [([], [], []) for _ in range(self.model.n_layer)]
+        logits = self.model.forward_token(self.ids[0], 0, kv_cache)
+        self.assertEqual(len(logits), self.model.vocab_size)
+        self.assertIsInstance(logits[0], nanoagi.Val)
+
+    def test_forward_token_kv_cache_grows(self):
+        """KV cache accumulates entries for each position."""
+        self.model.init_from_metaweights(self.meta)
+        kv_cache = [([], [], []) for _ in range(self.model.n_layer)]
+        self.model.forward_token(self.ids[0], 0, kv_cache)
+        self.model.forward_token(self.ids[1], 1, kv_cache)
+        for k_cache, vc_cache, vr_cache in kv_cache:
+            self.assertEqual(len(k_cache), 2)
+            self.assertEqual(len(vc_cache), 2)
+            self.assertEqual(len(vr_cache), 2)
+
+    def test_generate_returns_tokens(self):
+        """Real transformer generate produces tokens beyond prompt."""
+        self.model.init_from_metaweights(self.meta)
+        prompt = self.ids[:3]
+        generated = self.model.generate(prompt, max_tokens=5, meta=self.meta)
+        self.assertGreater(len(generated), len(prompt))
+        self.assertEqual(generated[:len(prompt)], prompt)
+
+    def test_generate_all_valid_ids(self):
+        """Generated token IDs are all within vocab range."""
+        self.model.init_from_metaweights(self.meta)
+        prompt = self.ids[:3]
+        generated = self.model.generate(prompt, max_tokens=5, meta=self.meta)
+        for tok in generated:
+            self.assertGreaterEqual(tok, 0)
+            self.assertLess(tok, self.karl.vocab_size)
+
     def test_continue_phrase(self):
         result = nanoagi.continue_phrase(
             "the transformer", self.karl, self.meta, self.model
