@@ -686,8 +686,117 @@ if TORCH_AVAILABLE:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VI. ENGINE — Karl + Chuck + NanoAGI + MetaWeights = nanoagi
-#     the moment of truth. or the moment of coherent bullshit. same thing.
+# VI. AUTORESEARCH — Karl hunts for food. inspired by @karpathy/autoresearch.
+#     when the corpus is small, Karl looks for more text. anywhere.
+#     he's not picky. he's hungry.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def autoresearch(karl, karl_txt_path, min_bytes=50000):
+    """
+    If karl.txt is too small, Karl hunts for more text.
+    Checks common locations for text files and ingests them.
+    Like Karpathy's autoresearch, but without the agents.
+    Karl IS the agent.
+    """
+    current_size = os.path.getsize(karl_txt_path) if os.path.exists(karl_txt_path) else 0
+    if current_size >= min_bytes:
+        return 0  # Karl is fed
+
+    print(f"  [KARL] Corpus too small ({current_size/1024:.0f}KB). Hunting for text...")
+    hunted = 0
+
+    # Hunt in common places
+    hunt_paths = []
+
+    # 1. Any .txt files in same directory
+    script_dir = os.path.dirname(os.path.abspath(karl_txt_path))
+    for f in os.listdir(script_dir):
+        if f.endswith('.txt') and f != os.path.basename(karl_txt_path):
+            hunt_paths.append(os.path.join(script_dir, f))
+
+    # 2. README files in parent directories
+    for depth in range(3):
+        parent = os.path.dirname(script_dir)
+        for _ in range(depth):
+            parent = os.path.dirname(parent)
+        for name in ['README.md', 'README.txt', 'readme.md']:
+            p = os.path.join(parent, name)
+            if os.path.exists(p):
+                hunt_paths.append(p)
+
+    # 3. Common corpus locations
+    home = os.path.expanduser('~')
+    for subdir in ['Downloads', 'Documents', 'Desktop']:
+        d = os.path.join(home, subdir)
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.endswith('.txt') and os.path.getsize(os.path.join(d, f)) < 500000:
+                    hunt_paths.append(os.path.join(d, f))
+                    if len(hunt_paths) > 20:  # don't go crazy
+                        break
+
+    # Ingest what we found
+    with open(karl_txt_path, 'a', encoding='utf-8', errors='replace') as corpus:
+        for path in hunt_paths:
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                if len(text) < 100:
+                    continue
+                if karl.ingest(text):
+                    corpus.write('\n' + text)
+                    hunted += len(text)
+                    print(f"  [KARL] Hunted: {os.path.basename(path)} ({len(text)/1024:.0f}KB)")
+            except (PermissionError, OSError):
+                continue
+
+    if hunted > 0:
+        print(f"  [KARL] Total hunted: {hunted/1024:.1f}KB from {len(hunt_paths)} sources")
+    else:
+        print(f"  [KARL] Nothing to hunt. Karl stays hungry.")
+
+    return hunted
+
+
+def autoresearch_url(karl, karl_txt_path, url=None):
+    """
+    Karl hunts the internet. If urllib is available.
+    Fetches a URL, strips HTML (crudely), ingests text.
+    """
+    try:
+        from urllib.request import urlopen
+    except ImportError:
+        return 0
+
+    if url is None:
+        # Default: fetch something educational
+        urls = [
+            "https://raw.githubusercontent.com/karpathy/nanoGPT/master/README.md",
+            "https://raw.githubusercontent.com/ariannamethod/postgpt/main/README.md",
+        ]
+        url = random.choice(urls)
+
+    try:
+        print(f"  [KARL] Fetching {url}...")
+        response = urlopen(url, timeout=10)
+        text = response.read().decode('utf-8', errors='replace')
+        # Crude HTML stripping
+        import re
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if karl.ingest(text):
+            with open(karl_txt_path, 'a', encoding='utf-8') as f:
+                f.write('\n' + text)
+            print(f"  [KARL] Fetched and ingested {len(text)/1024:.1f}KB from web")
+            return len(text)
+    except Exception as e:
+        print(f"  [KARL] Failed to fetch: {e}")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VII. ENGINE — Karl + Chuck + NanoAGI + MetaWeights = nanoagi
+#      the moment of truth. or the moment of coherent bullshit. same thing.
 # ─────────────────────────────────────────────────────────────────────────────
 
 KARL_TXT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'karl.txt')
@@ -723,8 +832,13 @@ def load_engine():
         raw_data = f.read()
     print(f"  Corpus: {len(raw_data)} bytes ({len(raw_data)/1024:.1f}KB)")
 
+    # Autoresearch: Karl hunts for food if corpus is small
+    print(f"\n[2] Autoresearch...")
+    karl_tmp = KARL()  # temp instance for ingestion tracking
+    autoresearch(karl_tmp, KARL_TXT, min_bytes=50000)
+
     # KARL tokenizer
-    print(f"\n[2] KARL tokenizer...")
+    print(f"\n[3] KARL tokenizer...")
     karl = KARL(max_merges=2048)
     if karl.load_state(KARL_MEM):
         token_ids = karl.encode(raw_data)
@@ -889,7 +1003,9 @@ def repl(karl, meta, model):
     print("  nanoagi REPL — talk to Karl")
     print("  type text → generate continuation")
     print("  paste large text → Karl ingests it")
-    print("  'quit' to exit, 'status' for Karl's state")
+    print("  'hunt' → Karl searches local files for food")
+    print("  'fetch <url>' → Karl hunts the internet")
+    print("  'status' → Karl's state | 'quit' → exit")
     print("=" * 60)
     print("\n  Hello! I am a helpful AGI. At least I try.")
     print("  How can I help you?\n")
@@ -909,10 +1025,27 @@ def repl(karl, meta, model):
             print(f"  [KARL] vocab={karl.vocab_size}, merges={len(karl.merges)}, "
                   f"ingested={karl.total_ingested}B, retrains={karl.retrain_count}")
             print(f"  [KARL] pending={len(karl.pending_text)}B / {karl.retrain_threshold}B until retokenization")
+            corpus_size = os.path.getsize(KARL_TXT) if os.path.exists(KARL_TXT) else 0
+            print(f"  [KARL] karl.txt: {corpus_size/1024:.1f}KB")
             if TORCH_AVAILABLE:
-                print(f"  [Chuck] awake, dampen=?, ready to train")
+                print(f"  [Chuck] awake, ready to train")
             else:
                 print(f"  [Chuck] sleeping (no PyTorch)")
+            continue
+        if user_input.strip().lower() == 'hunt':
+            print(f"  [KARL] Hunting for local text files...")
+            hunted = autoresearch(karl, KARL_TXT, min_bytes=0)
+            if hunted > 0 and karl.should_retokenize():
+                with open(KARL_TXT, 'rb') as f:
+                    full_corpus = f.read()
+                token_ids = karl.retokenize(full_corpus)
+                meta.expand_vocab(karl.vocab_size)
+                meta.build(token_ids, window=4)
+                model.init_from_metaweights(meta)
+            continue
+        if user_input.strip().lower().startswith('fetch '):
+            url = user_input.strip()[6:]
+            autoresearch_url(karl, KARL_TXT, url)
             continue
 
         # Generate response
