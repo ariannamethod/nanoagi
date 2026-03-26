@@ -3,7 +3,6 @@ nanoagi.py — a self-expanding BPE transformer that grows from conversation.
 
 KARL (Kernel Autonomous Recursive Learning) is the tokenizer.
 Chuck is the optimizer. Together they are nanoagi.
-They are not AGI. They just don't know that yet.
 
 How it works:
 1. KARL tokenizes karl.txt (starts with seed corpus, grows via REPL)
