@@ -266,7 +266,10 @@ class KARL:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MetaWeights:
-    """Metaweights with incremental update support."""
+    """
+    Metaweights with incremental update support.
+    Tracks knowledge size for gap analysis vs trained weights.
+    """
 
     def __init__(self, vocab_size, context_len):
         self.vocab_size = vocab_size
@@ -276,6 +279,31 @@ class MetaWeights:
         self.trigram = {}
         self.hebbian = {}
         self.total = 0
+        self.chuck_trained_steps = 0  # how many steps Chuck has trained
+
+    def knowledge_size(self):
+        """How much the ghost knows."""
+        return len(self.bigram) + len(self.trigram) + len(self.hebbian)
+
+    def knowledge_gap(self):
+        """
+        Gap between ghost (metaweights) and flesh (trained weights).
+        High gap = Karl learned faster than Chuck trained.
+        When gap > threshold → Chuck should train.
+        """
+        meta_k = self.knowledge_size()
+        chuck_k = self.chuck_trained_steps
+        if chuck_k == 0:
+            return float('inf') if meta_k > 0 else 0.0
+        return meta_k / (chuck_k + 1)
+
+    def knowledge_report(self):
+        """One-line report for status command."""
+        meta_k = self.knowledge_size()
+        gap = self.knowledge_gap()
+        return (f"meta_knowledge={meta_k:,} (bi={len(self.bigram)}, "
+                f"tri={len(self.trigram)}, heb={len(self.hebbian)}) | "
+                f"chuck_steps={self.chuck_trained_steps} | gap={gap:.1f}")
 
     def build(self, token_ids, window=4):
         n = len(token_ids)
@@ -870,12 +898,12 @@ def load_engine():
     # If Chuck is here, initial training
     if TORCH_AVAILABLE:
         print(f"\n[6] Chuck smells PyTorch. Initial training...")
-        chuck_train(karl, token_ids, model, steps=200)
+        chuck_train(karl, token_ids, model, steps=200, meta=meta)
 
     return karl, meta, model
 
 
-def chuck_train(karl, token_ids, model, steps=200):
+def chuck_train(karl, token_ids, model, steps=200, meta=None):
     """
     Chuck wakes up and trains real weights.
     Karl called. Smells like PyTorch. Time to work.
@@ -978,6 +1006,10 @@ def chuck_train(karl, token_ids, model, steps=200):
         print(f"  [Chuck] Done. loss: {first:.2f} → {last:.2f} "
               f"({(first-last)/first*100:.0f}% improvement) [{elapsed:.1f}s]")
         print(f"  [Chuck] Karl, your weights are warm now.")
+        if meta is not None:
+            meta.chuck_trained_steps += steps
+            gap = meta.knowledge_gap()
+            print(f"  [Chuck] Knowledge gap: {gap:.1f} (meta knows {meta.knowledge_size():,}, Chuck trained {meta.chuck_trained_steps} steps)")
     else:
         print(f"  [Chuck] No training happened. Karl, feed me more.")
 
@@ -1027,8 +1059,13 @@ def repl(karl, meta, model):
             print(f"  [KARL] pending={len(karl.pending_text)}B / {karl.retrain_threshold}B until retokenization")
             corpus_size = os.path.getsize(KARL_TXT) if os.path.exists(KARL_TXT) else 0
             print(f"  [KARL] karl.txt: {corpus_size/1024:.1f}KB")
+            print(f"  [Knowledge] {meta.knowledge_report()}")
             if TORCH_AVAILABLE:
-                print(f"  [Chuck] awake, ready to train")
+                gap = meta.knowledge_gap()
+                if gap > 50:
+                    print(f"  [Chuck] awake. gap={gap:.0f} — Karl knows way more than me. train me!")
+                else:
+                    print(f"  [Chuck] awake. gap={gap:.0f} — we're in sync.")
             else:
                 print(f"  [Chuck] sleeping (no PyTorch)")
             continue
@@ -1080,7 +1117,7 @@ def repl(karl, meta, model):
             # If Chuck is awake, train
             if TORCH_AVAILABLE:
                 print(f"  [KARL] Chuck! We have new material.")
-                chuck_train(karl, token_ids, model, steps=200)
+                chuck_train(karl, token_ids, model, steps=200, meta=meta)
 
         step += 1
 
