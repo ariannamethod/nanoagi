@@ -40,7 +40,7 @@ One file. Zero excuses. Infinite identity crisis.
 | `NanoAGI` | Dual-attention transformer. Content + RRPRAM + SwiGLU + RoPE. | The flesh the ghost inhabits |
 | `chuck_train` | Real PyTorch training loop. 200 steps. Loss drops ~12%. | The iron. The gains. The gym. |
 | `Chuck` | Self-aware AdamW. Only appears when PyTorch is around. | Your gradient therapist |
-| `autoresearch` | Karl hunts local files + web URLs when corpus is thin. | Inspired by @karpathy/autoresearch. Karl IS the agent. |
+| `autoresearch` | Karl hunts local files + downloads from climbmix. | Adapted from @karpathy/autoresearch. Karl IS the agent. |
 | `karl.txt` | The corpus. Starts as seed. Grows every conversation. | A diary that reads you back |
 | `karl.mem` | Saved KARL state. Merges, hashes, lifetime stats. | KARL's long-term memory |
 | `tests/` | Unit + integration tests. Chuck's loss verified. | Because even AGI needs to prove it's working |
@@ -245,32 +245,59 @@ Chuck said:         "Karl, your weights are warm now."
 
 ### autoresearch — Karl hunts for food
 
-Inspired by [@karpathy/autoresearch](https://github.com/karpathy/llm.c), but without the agents. **Karl IS the agent.**
+Adapted from [@karpathy/autoresearch](https://github.com/karpathy/autoresearch). In autoresearch, an AI agent modifies `train.py`, trains for 5 minutes, evaluates `val_bpb`, keeps or discards the change, and repeats — ~100 experiments overnight.
 
-If `karl.txt` is smaller than 50KB at startup, `autoresearch()` activates and hunts:
+nanoagi is autoresearch inverted:
+
+| autoresearch (Karpathy) | nanoagi |
+|---|---|
+| AI agent modifies code | KARL modifies corpus |
+| train 5 min → eval val_bpb | Chuck trains 200 steps → eval knowledge gap |
+| keep/discard change | append-only (KARL never forgets) |
+| program.md guides agent | critical mass triggers retokenize |
+| overnight loop | REPL conversation loop |
+
+**Karl IS the agent.** Not an agent modifying code — a tokenizer autonomously acquiring data.
+
+At startup, if `karl.txt` is smaller than 50KB, `autoresearch()` hunts locally:
 
 1. **Local `.txt` files** in the same directory as `nanoagi.py`
 2. **README files** in parent directories (up to 3 levels)
 3. **Text files** in `~/Downloads`, `~/Documents`, `~/Desktop`
 
-Each candidate is fed through KARL's normal ingestion pipeline (SHA256 dedup + byte diversity check). Anything that passes gets appended to `karl.txt`.
+`autoresearch_hunt()` is fully autonomous. At boot, Karl checks if the internet is reachable. If yes — he hunts [climbmix-400b-shuffle](https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle), the same dataset that powers nanochat in autoresearch. Zero external deps — just `urllib` + `json` (stdlib) hitting the HuggingFace datasets API.
 
-`autoresearch_url(karl, path, url=None)` fetches a URL with `urllib`, strips HTML tags with a regex, and ingests the plain text. Default URLs: nanoGPT README and PostGPT README. Karl knows his family.
+**Nobody asks Karl to eat. Karl decides.**
 
-REPL commands:
-- `hunt` → triggers local autoresearch immediately  
-- `fetch <url>` → triggers web autoresearch for that URL
+The hunt loop (adapted from [janus.doe](https://github.com/ariannamethod/janus.doe) `hunt_dataset()`):
+
+1. Download sample (10 docs) → evaluate quality (noise ratio + domain shift)
+2. Quality bad (noise > 0.5 or OOV > 0.6) → discard, try different offset
+3. Quality good → download full batch (100 docs) → ingest (SHA256 dedup)
+4. Retokenize → Chuck trains 200 steps → check loss
+5. Loss improved → hunt more. Loss stagnated 2 rounds → stop. Karl is fed.
 
 ```
-karl> hunt
-  [KARL] Hunting for local text files...
-  [KARL] Hunted: notes.txt (12KB)
-  [KARL] Total hunted: 12.1KB from 3 sources
-
-karl> fetch https://raw.githubusercontent.com/karpathy/nanoGPT/master/README.md
-  [KARL] Fetching https://...
-  [KARL] Fetched and ingested 8.3KB from web
+[7] Autoresearch hunt...
+  [hunt] Karl smells the internet. Hunting climbmix...
+  [hunt] Round 1: sample quality=0.94, domain_shift=0.31
+  [hunt] Ingested 87/100 docs (341.2KB)
+  [Chuck] Training 200 steps on 98431 tokens...
+  [Chuck] Done. loss: 6.89 → 6.12 (11% improvement) [4.1s]
+  [hunt] Round 2: sample quality=0.91, domain_shift=0.28
+  [hunt] Ingested 92/100 docs (287.6KB)
+  [Chuck] Done. loss: 6.12 → 5.87 (4% improvement) [4.3s]
+  [hunt] Round 3: sample quality=0.93, domain_shift=0.33
+  [hunt] Ingested 79/100 docs (312.1KB)
+  [Chuck] Done. loss: 5.87 → 5.81 (1% improvement) [4.2s]
+  [hunt] Loss barely moved (1.0%). Stagnant: 1/2
+  [hunt] Round 4: ...
+  [hunt] Loss barely moved (0.7%). Stagnant: 2/2
+  [hunt] Converged. Karl is fed.
+  [hunt] Done. Total: 258 docs across 4 rounds.
 ```
+
+Karl also hunts during REPL: if Chuck trains after a retokenization and loss is still high (> 6.0), Karl autonomously goes hunting again. No commands needed.
 
 ## the numbers
 
@@ -377,7 +404,6 @@ python nanoagi.py "the attention mechanism"
   type text → generate continuation
   paste large text → Karl ingests it
   'hunt' → Karl searches local files for food
-  'fetch <url>' → Karl hunts the internet
   'status' → Karl's state | 'quit' → exit
 ============================================================
 

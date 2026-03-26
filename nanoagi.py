@@ -930,9 +930,10 @@ if TORCH_AVAILABLE:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VI. AUTORESEARCH — Karl hunts for food. inspired by @karpathy/autoresearch.
-#     when the corpus is small, Karl looks for more text. anywhere.
-#     he's not picky. he's hungry.
+# VI. AUTORESEARCH — Karl hunts for food. adapted from @karpathy/autoresearch.
+#     autoresearch inverted: not an agent modifying code,
+#     but a tokenizer autonomously acquiring data.
+#     Karl IS the agent. Karl decides when to eat, what to eat, and when to stop.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def autoresearch(karl, karl_txt_path, min_bytes=50000):
@@ -1002,40 +1003,202 @@ def autoresearch(karl, karl_txt_path, min_bytes=50000):
     return hunted
 
 
-def autoresearch_url(karl, karl_txt_path, url=None):
+def _has_internet():
+    """Check if HuggingFace datasets API is reachable."""
+    try:
+        from urllib.request import urlopen, Request
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = Request("https://datasets-server.huggingface.co/",
+                      method='HEAD')
+        req.add_header('User-Agent', 'nanoagi/1.0 (KARL)')
+        urlopen(req, timeout=5, context=ctx)
+        return True
+    except Exception:
+        return False
+
+
+def _download_climbmix_batch(num_docs=50, offset=None):
     """
-    Karl hunts the internet. If urllib is available.
-    Fetches a URL, strips HTML (crudely), ingests text.
+    Download a batch of text from climbmix-400b-shuffle.
+    Returns list of text strings, or empty list on failure.
     """
     try:
-        from urllib.request import urlopen
+        from urllib.request import urlopen, Request
+        import json
+        import ssl
     except ImportError:
+        return []
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    if offset is None:
+        offset = random.randint(0, 500_000)
+
+    url = (f"https://datasets-server.huggingface.co/rows"
+           f"?dataset=karpathy/climbmix-400b-shuffle"
+           f"&config=default&split=train"
+           f"&offset={offset}&length={num_docs}")
+
+    try:
+        req = Request(url)
+        req.add_header('User-Agent', 'nanoagi/1.0 (KARL)')
+        response = urlopen(req, timeout=30, context=ctx)
+        data = json.loads(response.read().decode('utf-8'))
+
+        texts = []
+        for row in data.get('rows', []):
+            text = row.get('row', {}).get('text', '')
+            if len(text) > 100:
+                texts.append(text)
+        return texts
+    except Exception:
+        return []
+
+
+def _evaluate_batch_quality(karl, texts):
+    """
+    Evaluate quality of a text batch before ingestion.
+    Adapted from janus.doe ParserEye: noise ratio + domain shift.
+
+    Returns (quality, domain_shift) where:
+    - quality: 1.0 = clean, 0.0 = garbage (noise ratio)
+    - domain_shift: 0.0 = fits KARL's vocab, 1.0 = all unknown tokens (OOV rate)
+    """
+    total_chars = 0
+    noise_chars = 0
+    oov_tokens = 0
+    total_tokens = 0
+
+    for text in texts:
+        total_chars += len(text)
+        for c in text:
+            if not c.isprintable() and c not in '\n\r\t':
+                noise_chars += 1
+        tokens = karl.encode(text)
+        total_tokens += len(tokens)
+        for t in tokens:
+            if t < 256:  # single-byte = KARL doesn't know this pattern
+                oov_tokens += 1
+
+    noise_ratio = noise_chars / max(1, total_chars)
+    quality = 1.0 - noise_ratio
+    domain_shift = oov_tokens / max(1, total_tokens)
+
+    return quality, domain_shift
+
+
+def autoresearch_hunt(karl, karl_txt_path, meta=None, model=None, max_rounds=5):
+    """
+    Karl autonomously hunts from climbmix-400b-shuffle.
+    Adapted from janus.doe hunt_dataset().
+
+    No human involved. Karl decides:
+    - WHEN to eat (knowledge gap high, or called from load_engine)
+    - WHAT to eat (quality filter: noise < 0.5, domain_shift < 0.6)
+    - WHEN TO STOP (loss convergence or max rounds)
+
+    Pipeline per round:
+    1. Download sample (10 docs) → evaluate quality
+    2. Quality bad → skip, try different offset
+    3. Quality good → download full batch (100 docs)
+    4. Ingest → retokenize → Chuck trains 200 steps
+    5. Loss improved → next round. Loss stagnated → stop.
+    """
+    if not _has_internet():
+        print("  [hunt] No internet. Karl stays local.")
         return 0
 
-    if url is None:
-        # Default: fetch something educational
-        urls = [
-            "https://raw.githubusercontent.com/karpathy/nanoGPT/master/README.md",
-            "https://raw.githubusercontent.com/ariannamethod/postgpt/main/README.md",
-        ]
-        url = random.choice(urls)
+    print(f"  [hunt] Karl smells the internet. Hunting climbmix...")
 
-    try:
-        print(f"  [KARL] Fetching {url}...")
-        response = urlopen(url, timeout=10)
-        text = response.read().decode('utf-8', errors='replace')
-        # Crude HTML stripping
-        import re
-        text = re.sub(r'<[^>]+>', '', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        if karl.ingest(text):
-            with open(karl_txt_path, 'a', encoding='utf-8') as f:
-                f.write('\n' + text)
-            print(f"  [KARL] Fetched and ingested {len(text)/1024:.1f}KB from web")
-            return len(text)
-    except Exception as e:
-        print(f"  [KARL] Failed to fetch: {e}")
-    return 0
+    total_ingested = 0
+    last_loss = None
+    stagnant_rounds = 0
+
+    for rnd in range(max_rounds):
+        # 1. Sample — small batch to evaluate quality
+        sample = _download_climbmix_batch(num_docs=10)
+        if not sample:
+            print(f"  [hunt] Round {rnd+1}: download failed. Stopping.")
+            break
+
+        quality, shift = _evaluate_batch_quality(karl, sample)
+        print(f"  [hunt] Round {rnd+1}: sample quality={quality:.2f}, "
+              f"domain_shift={shift:.2f}")
+
+        if quality < 0.5 or shift > 0.6:
+            print(f"  [hunt] Bad batch (noise or OOV too high). Skipping.")
+            continue
+
+        # 2. Full download — different offset for fresh data
+        texts = _download_climbmix_batch(num_docs=100)
+        if not texts:
+            print(f"  [hunt] Full download failed. Stopping.")
+            break
+
+        # 3. Ingest — KARL dedup handles duplicates
+        ingested = 0
+        ingested_bytes = 0
+        with open(karl_txt_path, 'a', encoding='utf-8') as f:
+            for text in texts:
+                if karl.ingest(text):
+                    f.write('\n' + text)
+                    ingested += 1
+                    ingested_bytes += len(text)
+
+        if ingested == 0:
+            print(f"  [hunt] All duplicates. Karl has seen this before. Stopping.")
+            break
+
+        total_ingested += ingested
+        print(f"  [hunt] Ingested {ingested}/{len(texts)} docs "
+              f"({ingested_bytes/1024:.1f}KB)")
+
+        # 4. Retokenize
+        with open(karl_txt_path, 'rb') as f:
+            full_corpus = f.read()
+        token_ids = karl.retokenize(full_corpus)
+        if meta is not None:
+            meta.expand_vocab(karl.vocab_size)
+            meta.build(token_ids, window=4)
+        if model is not None:
+            model.init_from_metaweights(meta)
+        karl.save_state(karl_txt_path.replace('.txt', '.mem'))
+
+        # 5. Chuck trains — check convergence
+        if TORCH_AVAILABLE and model is not None and meta is not None:
+            new_loss = chuck_train(karl, token_ids, model, steps=200, meta=meta)
+
+            if last_loss is not None and new_loss is not None:
+                improvement = (last_loss - new_loss) / last_loss
+                if improvement < 0.02:  # less than 2% improvement
+                    stagnant_rounds += 1
+                    print(f"  [hunt] Loss barely moved ({improvement*100:.1f}%). "
+                          f"Stagnant: {stagnant_rounds}/2")
+                    if stagnant_rounds >= 2:
+                        print(f"  [hunt] Converged. Karl is fed.")
+                        break
+                else:
+                    stagnant_rounds = 0
+                    print(f"  [hunt] Loss improved {improvement*100:.1f}%. "
+                          f"Hunting more.")
+            last_loss = new_loss
+        else:
+            # No PyTorch — can't check convergence, do one round only
+            print(f"  [hunt] No PyTorch for convergence check. One round only.")
+            break
+
+    if total_ingested > 0:
+        print(f"  [hunt] Done. Total: {total_ingested} docs across "
+              f"{min(rnd+1, max_rounds)} rounds.")
+    else:
+        print(f"  [hunt] Nothing edible found. Karl stays hungry.")
+
+    return total_ingested
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1089,6 +1252,8 @@ def load_engine():
         print(f"  Loaded previous state. Encoding: {len(token_ids)} tokens")
     else:
         token_ids = karl.learn(raw_data, num_merges=1024)
+        karl.save_state(KARL_MEM)
+        print(f"  Saved state to {os.path.basename(KARL_MEM)}")
 
     # MetaWeights
     print(f"\n[3] Building metaweights...")
@@ -1115,6 +1280,11 @@ def load_engine():
     if TORCH_AVAILABLE:
         print(f"\n[6] Chuck smells PyTorch. Initial training...")
         chuck_train(karl, token_ids, model, steps=200, meta=meta)
+
+    # Autonomous hunt — Karl feeds himself from climbmix
+    # No human involved. Stops on convergence.
+    print(f"\n[7] Autoresearch hunt...")
+    autoresearch_hunt(karl, KARL_TXT, meta=meta, model=model, max_rounds=5)
 
     return karl, meta, model
 
@@ -1226,8 +1396,10 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None):
             meta.chuck_trained_steps += steps
             gap = meta.knowledge_gap()
             print(f"  [Chuck] Knowledge gap: {gap:.1f} (meta knows {meta.knowledge_size():,}, Chuck trained {meta.chuck_trained_steps} steps)")
+        return last
     else:
         print(f"  [Chuck] No training happened. Karl, feed me more.")
+        return None
 
 
 def continue_phrase(prompt, karl, meta, model, max_tokens=80, temperature=0.75):
@@ -1252,7 +1424,6 @@ def repl(karl, meta, model):
     print("  type text → generate continuation")
     print("  paste large text → Karl ingests it")
     print("  'hunt' → Karl searches local files for food")
-    print("  'fetch <url>' → Karl hunts the internet")
     print("  'status' → Karl's state | 'quit' → exit")
     print("=" * 60)
     print("\n  Hello! I am a helpful AGI. At least I try.")
@@ -1296,9 +1467,9 @@ def repl(karl, meta, model):
                 meta.build(token_ids, window=4)
                 model.init_from_metaweights(meta)
             continue
-        if user_input.strip().lower().startswith('fetch '):
-            url = user_input.strip()[6:]
-            autoresearch_url(karl, KARL_TXT, url)
+        if user_input.strip().lower() == 'feed':
+            # Manual trigger for autonomous hunt
+            autoresearch_hunt(karl, KARL_TXT, meta=meta, model=model, max_rounds=3)
             continue
 
         # Generate response
@@ -1330,10 +1501,14 @@ def repl(karl, meta, model):
             model.init_from_metaweights(meta)
             karl.save_state(KARL_MEM)
 
-            # If Chuck is awake, train
+            # If Chuck is awake, train — and hunt if stagnating
             if TORCH_AVAILABLE:
                 print(f"  [KARL] Chuck! We have new material.")
-                chuck_train(karl, token_ids, model, steps=200, meta=meta)
+                loss = chuck_train(karl, token_ids, model, steps=200, meta=meta)
+                # Stagnation check — if loss barely moved, Karl hunts autonomously
+                if loss is not None and loss > 6.0:
+                    print(f"  [KARL] Loss still high ({loss:.2f}). Hunting for more data...")
+                    autoresearch_hunt(karl, KARL_TXT, meta=meta, model=model, max_rounds=2)
 
         step += 1
 

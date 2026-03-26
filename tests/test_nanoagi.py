@@ -511,19 +511,22 @@ class TestAutoresearch(unittest.TestCase):
         finally:
             os.unlink(small_path)
 
-    def test_autoresearch_url_fails_gracefully(self):
-        """autoresearch_url should return 0 on unreachable URLs."""
+    def test_evaluate_batch_quality(self):
+        """_evaluate_batch_quality returns quality and domain_shift."""
         k = make_karl(merges=16)
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8"
-        ) as f:
-            f.write(SEED_CORPUS)
-            path = f.name
-        try:
-            result = nanoagi.autoresearch_url(k, path, url="http://127.0.0.1:1/noexist")
-            self.assertEqual(result, 0)
-        finally:
-            os.unlink(path)
+        texts = ["The transformer architecture uses attention mechanisms for sequence modeling.",
+                 "BPE tokenization compresses text by merging frequent byte pairs."]
+        quality, shift = nanoagi._evaluate_batch_quality(k, texts)
+        self.assertGreater(quality, 0.5)
+        self.assertGreaterEqual(shift, 0.0)
+        self.assertLessEqual(shift, 1.0)
+
+    def test_evaluate_batch_quality_noise(self):
+        """Noisy text should have lower quality score."""
+        k = make_karl(merges=16)
+        noisy = ["abc\x00\x01\x02\x03\x04" * 100]
+        quality, _ = nanoagi._evaluate_batch_quality(k, noisy)
+        self.assertLess(quality, 0.9)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
