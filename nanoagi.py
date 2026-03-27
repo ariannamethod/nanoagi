@@ -1482,7 +1482,8 @@ def _evaluate_genome(karl, token_ids, genome, train_seconds=30, device=None):
 
 
 def self_improve(karl, token_ids, max_experiments=50, train_seconds=30,
-                 total_budget=3600, results_file=None):
+                 total_budget=3600, results_file=None,
+                 stagnation_threshold=10, auto_self_code=True):
     """
     The Ratchet Loop — nanoagi evolves its own architecture.
 
@@ -1536,6 +1537,7 @@ def self_improve(karl, token_ids, max_experiments=50, train_seconds=30,
     best_genome = genome.copy()
     t_start = time.time()
     improvements = 0
+    stagnant = 0
     last_exp = 0
 
     for exp in range(1, max_experiments + 1):
@@ -1574,10 +1576,27 @@ def self_improve(karl, token_ids, max_experiments=50, train_seconds=30,
             best_bpb = bpb
             best_genome = genome.copy()
             improvements += 1
+            stagnant = 0
         else:
             print(f"  [SELF] No gain. val_bpb={bpb:.4f} vs best={best_bpb:.4f}. "
                   f"Reverting.")
             genome.genes = saved
+            stagnant += 1
+
+        # Stagnation → genome mutations exhausted → ask an LLM for help
+        # Like horizontal gene transfer in bacteria: when your own
+        # mutations can't save you, pull DNA from outside.
+        if (auto_self_code and stagnant >= stagnation_threshold
+                and os.environ.get('HF_TOKEN', '')):
+            print(f"\n  [SELF] {stagnant} experiments without improvement.")
+            print(f"  [SELF] Genome mutations exhausted. Calling self_code()...")
+            print(f"  [SELF] (horizontal gene transfer: pulling code from Qwen)")
+            sc_result = self_code(karl, KARL_TXT, max_attempts=2)
+            if sc_result and sc_result.get('status') == 'applied':
+                print(f"  [SELF] Code improved by Qwen. Resuming evolution.")
+            else:
+                print(f"  [SELF] Qwen couldn't help. Continuing mutations.")
+            stagnant = 0
 
         # Log result
         with open(results_file, 'a') as f:
