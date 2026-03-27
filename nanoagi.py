@@ -1688,10 +1688,122 @@ def coevolve(karl, karl_txt_path, max_rounds=3, evolve_per_round=5,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# X. SELF-CODE — the organism asks an LLM to improve it
-#    nanoagi reads its own source, sends it to a code LLM,
-#    applies the suggestion, tests, keeps or reverts.
-#    the code that writes itself. not a metaphor.
+# X. SWARM — release the hyenas
+#    mini-agents, each with a mission. go out in parallel. explore.
+#    come back. the pack shares what it found. the best result wins.
+#    "hyenas hunt in packs." — David Attenborough, probably.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hyena_explore(karl, token_ids, seed, n_mutations=10, train_seconds=15):
+    """One hyena's mission: explore genome space with its own random path."""
+    random.seed(seed)
+    genome = Genome()
+    best_bpb = float('inf')
+    best_genome = genome.copy()
+
+    for _ in range(n_mutations):
+        saved = dict(genome.genes)
+        gene, old, new = genome.mutate()
+        if gene is None:
+            continue
+        try:
+            bpb, _, _ = _evaluate_genome(karl, token_ids, genome,
+                                          train_seconds=train_seconds)
+        except Exception:
+            genome.genes = saved
+            continue
+        if bpb < best_bpb:
+            best_bpb = bpb
+            best_genome = genome.copy()
+        else:
+            genome.genes = saved
+
+    return best_genome, best_bpb
+
+
+def swarm(karl, token_ids, n_hyenas=4, mutations_per_hyena=10,
+          train_seconds=15):
+    """
+    Release the hyenas.
+
+    Each hyena is a mini-agent that explores a different part of the
+    genome space in parallel. Different random seed = different mutation
+    path = different region explored. The pack shares findings.
+    Best result wins. The pack is smarter than any single hyena.
+
+    Karpathy wants "swarm of agents emulating a research community."
+    We got there first. And we called them hyenas.
+    """
+    if not TORCH_AVAILABLE:
+        print("  [SWARM] Need PyTorch. The hyenas are sleeping.")
+        return None
+
+    import threading
+
+    print("\n" + "=" * 60)
+    print(f"  SWARM — releasing {n_hyenas} hyenas")
+    print(f"  mutations/hyena: {mutations_per_hyena}, "
+          f"train: {train_seconds}s/exp")
+    print("=" * 60)
+
+    results = [None] * n_hyenas
+    seeds = [random.randint(0, 999999) for _ in range(n_hyenas)]
+
+    def mission(idx):
+        results[idx] = _hyena_explore(
+            karl, token_ids, seeds[idx],
+            n_mutations=mutations_per_hyena,
+            train_seconds=train_seconds)
+
+    t0 = time.time()
+    threads = []
+    for i in range(n_hyenas):
+        print(f"  [SWARM] Releasing hyena-{i} (seed={seeds[i]})")
+        t = threading.Thread(target=mission, args=(i,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join(timeout=600)
+
+    elapsed = time.time() - t0
+
+    best_bpb = float('inf')
+    best_genome = None
+    leader = -1
+
+    print()
+    for i, r in enumerate(results):
+        if r is None:
+            print(f"  [SWARM] hyena-{i}: did not return")
+            continue
+        genome, bpb = r
+        tag = ""
+        if bpb < best_bpb:
+            best_bpb = bpb
+            best_genome = genome
+            leader = i
+            tag = " <-- pack leader"
+        print(f"  [SWARM] hyena-{i}: bpb={bpb:.4f} {genome}{tag}")
+
+    print(f"\n{'=' * 60}")
+    print(f"  SWARM COMPLETE — {n_hyenas} hyenas returned")
+    if leader >= 0:
+        print(f"  Pack leader: hyena-{leader} (bpb={best_bpb:.4f})")
+    if best_genome:
+        print(f"  Best genome: {best_genome}")
+    print(f"  Time: {elapsed:.0f}s "
+          f"(vs ~{elapsed * n_hyenas:.0f}s sequential)")
+    print(f"{'=' * 60}")
+
+    return best_genome, best_bpb
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# XI. SELF-CODE — the organism asks an LLM to improve it
+#     nanoagi reads its own source, sends it to a code LLM,
+#     applies the suggestion, tests, keeps or reverts.
+#     the code that writes itself. not a metaphor.
 # ─────────────────────────────────────────────────────────────────────────────
 
 SELF_CODE_PROMPT = """You are improving a self-expanding BPE transformer called nanoagi.
@@ -2164,6 +2276,7 @@ def repl(karl, meta, model):
     print("  'hunt' → Karl searches local files for food")
     print("  'evolve [N]' → self-improvement ratchet loop (N experiments)")
     print("  'coevolve' → co-evolution: hunt data + evolve architecture")
+    print("  'swarm [N]' → release N hyenas (parallel genome exploration)")
     print("  'selfcode' → ask a code LLM to improve nanoagi (needs HF_TOKEN)")
     print("  'status' → Karl's state | 'quit' → exit")
     print("=" * 60)
@@ -2224,6 +2337,15 @@ def repl(karl, meta, model):
             coevolve(karl, KARL_TXT, max_rounds=3, evolve_per_round=5,
                      train_seconds=30)
             continue
+        if user_input.strip().lower().startswith('swarm'):
+            parts = user_input.strip().split()
+            n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 4
+            with open(KARL_TXT, 'rb') as f:
+                corpus = f.read()
+            tids = karl.encode(corpus)
+            swarm(karl, tids, n_hyenas=n, mutations_per_hyena=10,
+                  train_seconds=15)
+            continue
         if user_input.strip().lower() == 'selfcode':
             self_code(karl, KARL_TXT)
             continue
@@ -2283,6 +2405,22 @@ def main():
     if result[0] is None:
         return
     karl, meta, model = result
+
+    # Swarm mode: python3 nanoagi.py --swarm [N]
+    if '--swarm' in sys.argv:
+        with open(KARL_TXT, 'rb') as f:
+            corpus = f.read()
+        token_ids = karl.encode(corpus)
+        n = 4
+        for i, arg in enumerate(sys.argv):
+            if arg == '--swarm' and i + 1 < len(sys.argv):
+                try:
+                    n = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+        swarm(karl, token_ids, n_hyenas=n, mutations_per_hyena=10,
+              train_seconds=30)
+        return
 
     # Co-evolution mode: python3 nanoagi.py --coevolve
     if '--coevolve' in sys.argv:
