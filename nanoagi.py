@@ -924,9 +924,122 @@ if TORCH_AVAILABLE:
                     state['exp_avg_sq'].mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                     bc1 = 1 - beta1 ** state['step']
                     bc2 = 1 - beta2 ** state['step']
-                    p.data.addcdiv_(state['exp_avg'] / bc1, state['exp_avg_sq'].sqrt() / bc2.__abs__() + eps, value=-lr)
+                    p.data.addcdiv_(state['exp_avg'] / bc1, state['exp_avg_sq'].sqrt() / bc2 + eps, value=-lr)
             self.global_step += 1
             return loss
+
+    # ─────────────────────────────────────────────────────────────────────
+    # V.b TorchNanoAGI — PyTorch model at module level
+    #     needed by self_improve(). also used inside chuck_train().
+    # ─────────────────────────────────────────────────────────────────────
+
+    class _RMSNorm(nn.Module):
+        def __init__(self, dim, eps=1e-5):
+            super().__init__()
+            self.eps = eps
+            self.weight = nn.Parameter(torch.ones(dim))
+        def forward(self, x):
+            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+    class _Block(nn.Module):
+        def __init__(self, n_embd, n_content, n_rrpram, hd, ctx, n_layer):
+            super().__init__()
+            self.n_embd = n_embd
+            self.n_content = n_content
+            self.n_rrpram = n_rrpram
+            self.hd = hd
+            self.norm1 = _RMSNorm(n_embd)
+            self.wq = nn.Linear(n_embd, n_content * hd, bias=False)
+            self.wk = nn.Linear(n_embd, n_content * hd, bias=False)
+            self.wv_content = nn.Linear(n_embd, n_content * hd, bias=False)
+            self.wr = nn.Parameter(torch.randn(n_rrpram, n_embd, ctx) * 0.02)
+            self.wv_rrpram = nn.Linear(n_embd, n_rrpram * hd, bias=False)
+            self.wo = nn.Linear(n_embd, n_embd, bias=False)
+            nn.init.normal_(self.wo.weight, std=0.02 / math.sqrt(2 * n_layer))
+            self.norm2 = _RMSNorm(n_embd)
+            self.mlp_gate = nn.Linear(n_embd, n_embd * 4, bias=False)
+            self.mlp_up = nn.Linear(n_embd, n_embd * 4, bias=False)
+            self.mlp_down = nn.Linear(n_embd * 4, n_embd, bias=False)
+            nn.init.normal_(self.mlp_down.weight, std=0.02 / math.sqrt(2 * n_layer))
+
+    class TorchNanoAGI(nn.Module):
+        def __init__(self, vocab_size, n_embd=64, n_head=4, n_layer=3, ctx=64,
+                     n_content=2, n_rrpram=2):
+            super().__init__()
+            self.ctx = ctx
+            self.n_embd = n_embd
+            self.n_content = n_content
+            self.n_rrpram = n_rrpram
+            hd = n_embd // n_head
+            self.hd = hd
+            self.wte = nn.Embedding(vocab_size, n_embd)
+            nn.init.normal_(self.wte.weight, std=0.02)
+            self.blocks = nn.ModuleList([
+                _Block(n_embd, n_content, n_rrpram, hd, ctx, n_layer)
+                for _ in range(n_layer)
+            ])
+            self.norm_f = _RMSNorm(n_embd)
+            self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+            self.lm_head.weight = self.wte.weight
+            for block in self.blocks:
+                for name, p in block.named_parameters():
+                    if p.dim() >= 2 and 'wo' not in name and 'mlp_down' not in name and 'wr' not in name:
+                        nn.init.normal_(p, std=0.02)
+            freqs = 1.0 / (10000.0 ** (torch.arange(0, hd, 2).float() / hd))
+            t = torch.arange(ctx).float()
+            angles = torch.outer(t, freqs)
+            self.register_buffer('rope_cos', angles.cos())
+            self.register_buffer('rope_sin', angles.sin())
+
+        def _apply_rope(self, x):
+            T = x.shape[2]
+            cos = self.rope_cos[:T].unsqueeze(0).unsqueeze(0)
+            sin = self.rope_sin[:T].unsqueeze(0).unsqueeze(0)
+            x1 = x[..., ::2]
+            x2 = x[..., 1::2]
+            return torch.stack([x1 * cos - x2 * sin,
+                                x1 * sin + x2 * cos], dim=-1).flatten(-2)
+
+        def forward(self, idx, targets=None):
+            B, T = idx.shape
+            x = self.wte(idx)
+            hd = self.hd
+            mask = torch.triu(torch.ones(T, T, device=idx.device,
+                              dtype=torch.bool), diagonal=1)
+            for block in self.blocks:
+                xn = block.norm1(x)
+                nc = block.n_content
+                nr = block.n_rrpram
+                q = block.wq(xn).view(B, T, nc, hd).transpose(1, 2)
+                k = block.wk(xn).view(B, T, nc, hd).transpose(1, 2)
+                v_c = block.wv_content(xn).view(B, T, nc, hd).transpose(1, 2)
+                q = self._apply_rope(q)
+                k = self._apply_rope(k)
+                c_attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
+                c_attn = c_attn.masked_fill(mask, float('-inf'))
+                c_attn = F.softmax(c_attn, dim=-1)
+                c_out = (c_attn @ v_c).transpose(1, 2).contiguous().view(B, T, nc * hd)
+                v_r = block.wv_rrpram(xn).view(B, T, nr, hd).transpose(1, 2)
+                r_outs = []
+                for h in range(nr):
+                    r_score = xn @ block.wr[h, :, :T]
+                    r_score = r_score.masked_fill(mask, float('-inf'))
+                    r_attn = F.softmax(r_score, dim=-1)
+                    r_out_h = r_attn @ v_r[:, h]
+                    r_outs.append(r_out_h)
+                r_out = torch.cat(r_outs, dim=-1)
+                combined = torch.cat([c_out, r_out], dim=-1)
+                x = x + block.wo(combined)
+                xn = block.norm2(x)
+                gate = F.silu(block.mlp_gate(xn))
+                up = block.mlp_up(xn)
+                x = x + block.mlp_down(gate * up)
+            logits = self.lm_head(self.norm_f(x))
+            loss = None
+            if targets is not None:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                       targets.view(-1))
+            return logits, loss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1202,6 +1315,290 @@ def autoresearch_hunt(karl, karl_txt_path, meta=None, model=None, max_rounds=5):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# VIII. SELF-IMPROVEMENT — The Ratchet Loop
+#       Karpathy showed the way with autoresearch:
+#         mutate train.py → train 5 min → eval val_bpb → keep or git reset.
+#       We took it one level deeper:
+#         the organism mutates its own genome → trains → eval → keep or revert.
+#       Same ratchet. No external agent. The code doesn't change. The DNA does.
+#       "if you can improve it, you can improve it again.
+#        and it doesn't need your permission."
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Genome:
+    """
+    The architectural DNA of nanoagi. Mutable. Evaluable. Evolvable.
+    Single-gene mutation: change one thing, measure, keep or revert.
+    Constraints enforced: n_embd % n_head == 0, n_content + n_rrpram == n_head.
+    """
+
+    MUTATION_SPACE = {
+        'n_embd':       [32, 48, 64, 96, 128],
+        'n_head':       [2, 4, 8],
+        'n_layer':      [1, 2, 3, 4, 6],
+        'n_content':    [1, 2, 3, 4],
+        'n_rrpram':     [1, 2, 3, 4],
+        'context_len':  [32, 48, 64, 96, 128],
+        'lr':           [1e-4, 2e-4, 3e-4, 5e-4, 1e-3],
+        'weight_decay': [0.0, 0.001, 0.01, 0.05, 0.1],
+        'beta1':        [0.85, 0.9, 0.95],
+        'beta2':        [0.95, 0.98, 0.999],
+    }
+
+    def __init__(self):
+        self.genes = {
+            'n_embd': 64, 'n_head': 4, 'n_layer': 3,
+            'n_content': 2, 'n_rrpram': 2, 'context_len': 64,
+            'lr': 3e-4, 'weight_decay': 0.01,
+            'beta1': 0.9, 'beta2': 0.999,
+        }
+
+    def mutate(self):
+        """Single-gene mutation. Returns (gene, old, new) or (None, None, None)."""
+        saved = dict(self.genes)
+        gene = random.choice(list(self.MUTATION_SPACE.keys()))
+        old = self.genes[gene]
+        choices = [v for v in self.MUTATION_SPACE[gene] if v != old]
+        if not choices:
+            return None, None, None
+        self.genes[gene] = random.choice(choices)
+        self._constrain()
+        # If constraint reverted everything, skip (no actual change)
+        if self.genes == saved:
+            return None, None, None
+        return gene, old, self.genes[gene]
+
+    def _constrain(self):
+        """Enforce architectural invariants."""
+        g = self.genes
+        # n_embd must be divisible by n_head
+        while g['n_embd'] % g['n_head'] != 0:
+            g['n_head'] = max(2, g['n_head'] - 1)
+        # n_content + n_rrpram must equal n_head (required by output projection)
+        if g['n_content'] + g['n_rrpram'] != g['n_head']:
+            g['n_content'] = max(1, g['n_head'] // 2)
+            g['n_rrpram'] = max(1, g['n_head'] - g['n_content'])
+
+    def copy(self):
+        g = Genome()
+        g.genes = dict(self.genes)
+        return g
+
+    def __repr__(self):
+        g = self.genes
+        return (f"Genome(embd={g['n_embd']}, head={g['n_head']}, "
+                f"layer={g['n_layer']}, ctx={g['context_len']}, "
+                f"lr={g['lr']}, wd={g['weight_decay']})")
+
+
+def _evaluate_genome(karl, token_ids, genome, train_seconds=30, device=None):
+    """
+    Train with given genome for fixed wall-clock time, return val BPB.
+    Time-based budget = fair comparison across architectures.
+    Karpathy uses 5 min on H100. We use 30s on Mac. Same ratchet.
+    """
+    if not TORCH_AVAILABLE:
+        return float('inf'), 0, 0
+
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Fixed seed per genome — same architecture always gets same init
+    # Hash genes to get deterministic seed (reproducible comparison)
+    genome_hash = hash(tuple(sorted(genome.genes.items()))) & 0x7FFFFFFF
+    torch.manual_seed(genome_hash)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(genome_hash)
+
+    g = genome.genes
+    split = int(len(token_ids) * 0.9)
+    train_ids = token_ids[:split]
+    val_ids = token_ids[split:]
+    ctx = g['context_len']
+
+    if len(val_ids) < ctx + 2:
+        return float('inf'), 0, 0
+
+    tmodel = TorchNanoAGI(
+        karl.vocab_size,
+        n_embd=g['n_embd'], n_head=g['n_head'], n_layer=g['n_layer'],
+        ctx=ctx, n_content=g['n_content'], n_rrpram=g['n_rrpram'],
+    ).to(device)
+
+    n_params = sum(p.numel() for p in tmodel.parameters())
+    optimizer = ChuckOptimizer(
+        tmodel.parameters(),
+        lr=g['lr'], betas=(g['beta1'], g['beta2']),
+        weight_decay=g['weight_decay'],
+    )
+
+    # Train for fixed wall-clock time — bigger models get fewer steps
+    t0 = time.time()
+    step = 0
+    tmodel.train()
+    while time.time() - t0 < train_seconds:
+        i = random.randint(0, max(0, len(train_ids) - ctx - 2))
+        x = torch.tensor([train_ids[i:i+ctx]], dtype=torch.long, device=device)
+        y = torch.tensor([train_ids[i+1:i+ctx+1]], dtype=torch.long, device=device)
+        if x.shape[1] < ctx or y.shape[1] < ctx:
+            continue
+        _, loss = tmodel(x, y)
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(tmodel.parameters(), 1.0)
+        optimizer.step(loss=loss.item())
+        step += 1
+
+    # Evaluate val BPB (bits per byte — vocab-size-independent, lower = better)
+    tmodel.eval()
+    val_losses = []
+    n_eval = min(50, max(1, len(val_ids) // ctx))
+    with torch.no_grad():
+        for _ in range(n_eval):
+            i = random.randint(0, max(0, len(val_ids) - ctx - 2))
+            x = torch.tensor([val_ids[i:i+ctx]], dtype=torch.long, device=device)
+            y = torch.tensor([val_ids[i+1:i+ctx+1]], dtype=torch.long, device=device)
+            if x.shape[1] < ctx or y.shape[1] < ctx:
+                continue
+            _, loss = tmodel(x, y)
+            val_losses.append(loss.item())
+
+    if not val_losses:
+        return float('inf'), n_params, step
+
+    avg_loss = sum(val_losses) / len(val_losses)
+    bpb = avg_loss / math.log(2)
+    return bpb, n_params, step
+
+
+def self_improve(karl, token_ids, max_experiments=50, train_seconds=30,
+                 total_budget=3600, results_file=None):
+    """
+    The Ratchet Loop — nanoagi evolves its own architecture.
+
+    Karpathy's autoresearch: an external agent mutates train.py, trains, evals.
+    nanoagi's self_improve: the organism mutates its own genome, trains, evals.
+    Same ratchet. One level deeper. No external agent needed.
+
+    Each experiment:
+    1. Mutate one gene (architecture or optimizer hyperparameter)
+    2. Train for fixed wall-clock time (fair cross-architecture comparison)
+    3. Evaluate val_bpb (bits per byte, vocab-independent)
+    4. Better -> keep mutation. Worse -> revert.
+    5. Log to results.tsv (Karpathy format)
+
+    "if you can improve it, you can improve it again.
+     and it doesn't need your permission."
+    """
+    if not TORCH_AVAILABLE:
+        print("  [SELF] Need PyTorch for self-improvement. Chuck is sleeping.")
+        return None
+
+    if results_file is None:
+        results_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     'results.tsv')
+
+    print("\n" + "=" * 60)
+    print("  SELF-IMPROVEMENT — The Ratchet Loop")
+    print("  mutate -> train -> eval -> keep or revert")
+    print(f"  experiments: {max_experiments}, "
+          f"train: {train_seconds}s/exp, budget: {total_budget}s")
+    print("=" * 60)
+
+    # Baseline genome — current nanoagi defaults
+    genome = Genome()
+    print(f"\n  [SELF] Baseline: {genome}")
+    print(f"  [SELF] Evaluating baseline...")
+    best_bpb, base_params, base_steps = _evaluate_genome(
+        karl, token_ids, genome, train_seconds=train_seconds)
+    print(f"  [SELF] Baseline: val_bpb={best_bpb:.4f}, "
+          f"params={base_params:,}, steps={base_steps}")
+
+    # Results log (Karpathy-style TSV)
+    write_header = not os.path.exists(results_file)
+    with open(results_file, 'a') as f:
+        if write_header:
+            f.write("exp\tgene\told\tnew\tval_bpb\tparams\tsteps\tkept\ttimestamp\n")
+        f.write(f"0\tbaseline\t-\t-\t{best_bpb:.4f}\t{base_params}\t"
+                f"{base_steps}\tTrue\t{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    baseline_bpb = best_bpb
+    best_genome = genome.copy()
+    t_start = time.time()
+    improvements = 0
+    last_exp = 0
+
+    for exp in range(1, max_experiments + 1):
+        last_exp = exp
+        if time.time() - t_start > total_budget:
+            print(f"\n  [SELF] Time budget exhausted. Stopping.")
+            break
+
+        # Save current state, mutate one gene
+        saved = dict(genome.genes)
+        gene, old_val, new_val = genome.mutate()
+        if gene is None:
+            continue
+
+        print(f"\n  [SELF] Exp {exp}/{max_experiments}: "
+              f"{gene} = {old_val} -> {new_val}")
+
+        # Train and evaluate
+        try:
+            bpb, n_params, steps = _evaluate_genome(
+                karl, token_ids, genome, train_seconds=train_seconds)
+        except Exception as e:
+            print(f"  [SELF] Failed: {e}. Reverting.")
+            genome.genes = saved
+            with open(results_file, 'a') as f:
+                f.write(f"{exp}\t{gene}\t{old_val}\t{new_val}\t"
+                        f"inf\t0\t0\tFalse\t{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            continue
+
+        kept = bpb < best_bpb
+
+        if kept:
+            pct = (best_bpb - bpb) / best_bpb * 100
+            print(f"  [SELF] IMPROVED! val_bpb: {best_bpb:.4f} -> {bpb:.4f} "
+                  f"(-{pct:.2f}%), params={n_params:,}, steps={steps}")
+            best_bpb = bpb
+            best_genome = genome.copy()
+            improvements += 1
+        else:
+            print(f"  [SELF] No gain. val_bpb={bpb:.4f} vs best={best_bpb:.4f}. "
+                  f"Reverting.")
+            genome.genes = saved
+
+        # Log result
+        with open(results_file, 'a') as f:
+            f.write(f"{exp}\t{gene}\t{old_val}\t{new_val}\t{bpb:.4f}\t"
+                    f"{n_params}\t{steps}\t{kept}\t"
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        # Progress report every 5 experiments
+        if exp % 5 == 0:
+            elapsed = time.time() - t_start
+            rate = exp / max(elapsed, 1) * 3600
+            print(f"\n  [SELF] --- {exp}/{max_experiments}, "
+                  f"{improvements} kept, best_bpb={best_bpb:.4f}, "
+                  f"{rate:.0f} exp/hr ---")
+
+    # Final report
+    elapsed = time.time() - t_start
+    total_pct = (baseline_bpb - best_bpb) / max(baseline_bpb, 1e-10) * 100
+    print(f"\n{'=' * 60}")
+    print(f"  SELF-IMPROVEMENT COMPLETE")
+    print(f"  Experiments: {last_exp}, Improvements: {improvements}")
+    print(f"  BPB: {baseline_bpb:.4f} -> {best_bpb:.4f} ({total_pct:+.2f}%)")
+    print(f"  Best: {best_genome}")
+    print(f"  Time: {elapsed:.0f}s ({last_exp / max(elapsed, 1) * 3600:.0f} exp/hr)")
+    print(f"  Results: {results_file}")
+    print(f"{'=' * 60}")
+
+    return best_genome, best_bpb
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # VII. ENGINE — Karl + Chuck + NanoAGI + MetaWeights = nanoagi
 #      the moment of truth. or the moment of coherent bullshit. same thing.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1428,7 +1825,7 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None):
                                        targets.view(-1))
             return logits, loss
 
-    device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     tmodel = TorchNanoAGI(karl.vocab_size, n_embd=64, n_head=4, n_layer=3,
                           ctx=64, n_content=2, n_rrpram=2).to(device)
     optimizer = ChuckOptimizer(tmodel.parameters(), lr=3e-4, weight_decay=0.01)
@@ -1496,6 +1893,7 @@ def repl(karl, meta, model):
     print("  type text → generate continuation")
     print("  paste large text → Karl ingests it")
     print("  'hunt' → Karl searches local files for food")
+    print("  'evolve [N]' → self-improvement ratchet loop (N experiments)")
     print("  'status' → Karl's state | 'quit' → exit")
     print("=" * 60)
     print("\n  Hello! I am a helpful AGI. At least I try.")
@@ -1542,6 +1940,14 @@ def repl(karl, meta, model):
         if user_input.strip().lower() == 'feed':
             # Manual trigger for autonomous hunt
             autoresearch_hunt(karl, KARL_TXT, meta=meta, model=model, max_rounds=3)
+            continue
+        if user_input.strip().lower().startswith('evolve'):
+            parts = user_input.strip().split()
+            n_exp = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 20
+            with open(KARL_TXT, 'rb') as f:
+                corpus = f.read()
+            tids = karl.encode(corpus)
+            self_improve(karl, tids, max_experiments=n_exp, train_seconds=30)
             continue
 
         # Generate response
@@ -1599,6 +2005,21 @@ def main():
     if result[0] is None:
         return
     karl, meta, model = result
+
+    # Self-improvement mode: python3 nanoagi.py --evolve [N]
+    if '--evolve' in sys.argv:
+        with open(KARL_TXT, 'rb') as f:
+            corpus = f.read()
+        token_ids = karl.encode(corpus)
+        n = 50
+        for i, arg in enumerate(sys.argv):
+            if arg == '--evolve' and i + 1 < len(sys.argv):
+                try:
+                    n = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+        self_improve(karl, token_ids, max_experiments=n, train_seconds=30)
+        return
 
     # If command-line prompt given, generate and exit
     if len(sys.argv) > 1:

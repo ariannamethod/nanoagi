@@ -787,12 +787,163 @@ class TestIntegration(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Genome + Self-Improvement tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGenome(unittest.TestCase):
+    """Tests for the Genome class — architectural DNA of nanoagi."""
+
+    def test_genome_defaults(self):
+        g = nanoagi.Genome()
+        self.assertEqual(g.genes['n_embd'], 64)
+        self.assertEqual(g.genes['n_head'], 4)
+        self.assertEqual(g.genes['n_layer'], 3)
+        self.assertEqual(g.genes['n_content'], 2)
+        self.assertEqual(g.genes['n_rrpram'], 2)
+
+    def test_genome_constraints_head_divisibility(self):
+        g = nanoagi.Genome()
+        g.genes['n_embd'] = 48
+        g.genes['n_head'] = 5  # 48 % 5 != 0
+        g._constrain()
+        self.assertEqual(g.genes['n_embd'] % g.genes['n_head'], 0)
+
+    def test_genome_constraints_content_rrpram_sum(self):
+        g = nanoagi.Genome()
+        g.genes['n_head'] = 8
+        g.genes['n_content'] = 3
+        g.genes['n_rrpram'] = 3  # 3+3=6 != 8
+        g._constrain()
+        self.assertEqual(g.genes['n_content'] + g.genes['n_rrpram'],
+                         g.genes['n_head'])
+
+    def test_genome_mutate_changes_one_gene(self):
+        random.seed(42)
+        g = nanoagi.Genome()
+        original = dict(g.genes)
+        gene, old, new = g.mutate()
+        self.assertIsNotNone(gene)
+        self.assertNotEqual(old, new)
+        # Only the mutated gene (+ constrained ones) should change
+        changed = [k for k in g.genes if g.genes[k] != original[k]]
+        self.assertIn(gene, changed)
+
+    def test_genome_mutate_always_valid(self):
+        """100 mutations should always produce valid architectures."""
+        random.seed(123)
+        g = nanoagi.Genome()
+        for _ in range(100):
+            g.mutate()
+            self.assertEqual(g.genes['n_embd'] % g.genes['n_head'], 0)
+            self.assertEqual(g.genes['n_content'] + g.genes['n_rrpram'],
+                             g.genes['n_head'])
+            self.assertGreater(g.genes['n_embd'], 0)
+            self.assertGreater(g.genes['n_layer'], 0)
+
+    def test_genome_copy_is_independent(self):
+        g = nanoagi.Genome()
+        c = g.copy()
+        c.genes['n_layer'] = 99
+        self.assertNotEqual(g.genes['n_layer'], 99)
+
+    def test_genome_repr(self):
+        g = nanoagi.Genome()
+        r = repr(g)
+        self.assertIn('Genome', r)
+        self.assertIn('embd=64', r)
+
+
+class TestSelfImprove(unittest.TestCase):
+    """Tests for evaluate_genome and self_improve."""
+
+    def setUp(self):
+        self.karl = make_karl(merges=64)
+        self.meta, self.ids = make_meta(self.karl)
+
+    @unittest.skipUnless(nanoagi.TORCH_AVAILABLE, "PyTorch required")
+    def test_evaluate_genome_returns_finite_bpb(self):
+        """_evaluate_genome must return a finite BPB with enough data."""
+        g = nanoagi.Genome()
+        # Use short train time for test speed
+        bpb, n_params, steps = nanoagi._evaluate_genome(
+            self.karl, self.ids, g, train_seconds=3)
+        self.assertLess(bpb, float('inf'))
+        self.assertGreater(bpb, 0)
+        self.assertGreater(n_params, 0)
+        self.assertGreater(steps, 0)
+
+    @unittest.skipUnless(nanoagi.TORCH_AVAILABLE, "PyTorch required")
+    def test_evaluate_genome_different_configs(self):
+        """Different genomes should produce different results."""
+        g1 = nanoagi.Genome()
+        g2 = nanoagi.Genome()
+        g2.genes['n_layer'] = 1
+        g2.genes['n_embd'] = 32
+        g2.genes['n_head'] = 2
+        g2.genes['n_content'] = 1
+        g2.genes['n_rrpram'] = 1
+        bpb1, p1, _ = nanoagi._evaluate_genome(
+            self.karl, self.ids, g1, train_seconds=2)
+        bpb2, p2, _ = nanoagi._evaluate_genome(
+            self.karl, self.ids, g2, train_seconds=2)
+        self.assertNotEqual(p1, p2)
+
+    @unittest.skipUnless(nanoagi.TORCH_AVAILABLE, "PyTorch required")
+    def test_self_improve_runs_and_logs(self):
+        """self_improve should run 3 experiments and produce results.tsv."""
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.NamedTemporaryFile(suffix='.tsv', delete=False) as f:
+            results_path = f.name
+        os.unlink(results_path)  # remove so self_improve writes header
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                result = nanoagi.self_improve(
+                    self.karl, self.ids,
+                    max_experiments=3,
+                    train_seconds=2,
+                    total_budget=60,
+                    results_file=results_path)
+            self.assertIsNotNone(result)
+            genome, bpb = result
+            self.assertIsInstance(genome, nanoagi.Genome)
+            self.assertGreater(bpb, 0)
+            # Check results file was created with header + entries
+            with open(results_path) as rf:
+                lines = rf.readlines()
+            self.assertGreaterEqual(len(lines), 2)  # header + baseline
+            self.assertIn('exp\t', lines[0])
+            self.assertIn('baseline', lines[1])
+            output = buf.getvalue()
+            self.assertIn('SELF-IMPROVEMENT', output)
+            self.assertIn('COMPLETE', output)
+        finally:
+            os.unlink(results_path)
+
+    @unittest.skipUnless(nanoagi.TORCH_AVAILABLE, "PyTorch required")
+    def test_torch_nanoagi_module_level(self):
+        """TorchNanoAGI at module level should build and forward."""
+        import torch
+        tmodel = nanoagi.TorchNanoAGI(
+            vocab_size=self.karl.vocab_size,
+            n_embd=32, n_head=2, n_layer=1, ctx=32,
+            n_content=1, n_rrpram=1)
+        x = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+        logits, loss = tmodel(x)
+        self.assertEqual(logits.shape[0], 1)
+        self.assertEqual(logits.shape[1], 5)
+        self.assertEqual(logits.shape[2], self.karl.vocab_size)
+        self.assertIsNone(loss)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # main
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("=" * 60)
     print("  nanoagi test suite — tests/")
-    print("  KARL · MetaWeights · NanoAGI · Val · Chuck · autoresearch")
+    print("  KARL · MetaWeights · NanoAGI · Val · Chuck · Genome · self_improve")
     print("=" * 60)
     unittest.main(verbosity=2)
