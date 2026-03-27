@@ -39,8 +39,9 @@ One file. Zero excuses. Infinite identity crisis.
 | `MetaWeights` | Unigram+bigram+trigram+hebbian+prophecy. The ghost. | Statistics that think they're weights. Correct. |
 | `NanoAGI` | Dual-attention transformer. Content + RRPRAM + SwiGLU + RoPE. | The flesh the ghost inhabits |
 | `chuck_train` | Real PyTorch training loop. 200 steps. Loss drops ~12%. | The iron. The gains. The gym. |
-| `Chuck` | Self-aware AdamW. Only appears when PyTorch is around. | Your gradient therapist |
+| `Chuck` | Full 9-level self-aware optimizer. EMA, per-layer awareness, memory, noise injection, macro patience. Battle-tested from [chuck.py](https://github.com/ariannamethod/chuck). | θ -= (α × S × λ_Ψ × λ_l × σ) × m̂/(√v̂ + ε) + η |
 | `autoresearch` | Karl hunts local files + downloads from climbmix. | Adapted from @karpathy/autoresearch. Karl IS the agent. |
+| `self_improve` | The Ratchet Loop. Mutate genome → train → eval val_bpb → keep or revert. | @karpathy/autoresearch, but the organism mutates itself. |
 | `karl.txt` | The corpus. Starts as seed. Grows every conversation. | A diary that reads you back |
 | `karl.mem` | Saved KARL state. Merges, hashes, lifetime stats. | KARL's long-term memory |
 | `tests/` | Unit + integration tests. Chuck's loss verified. | Because even AGI needs to prove it's working |
@@ -303,6 +304,77 @@ The hunt loop (adapted from [janus.doe](https://github.com/ariannamethod/janus.d
 
 Karl also hunts during REPL: if Chuck trains after a retokenization and loss is still high (> 6.0), Karl autonomously goes hunting again. No commands needed.
 
+## self-improvement — The Ratchet Loop
+
+Karpathy's [autoresearch](https://github.com/karpathy/autoresearch): an external AI agent mutates `train.py`, trains for 5 minutes, evaluates `val_bpb`, keeps or reverts via git. ~100 experiments overnight on H100.
+
+nanoagi's `self_improve`: the organism mutates **its own genome**, trains for fixed wall-clock time, evaluates `val_bpb`, keeps or reverts. No external agent. No code changes. The DNA changes.
+
+| | Karpathy autoresearch | nanoagi self_improve |
+|---|---|---|
+| What mutates | Code (`train.py`) | Genome (hyperparameters) |
+| Who mutates | External AI agent | The organism itself |
+| Metric | `val_bpb` | `val_bpb` |
+| Budget | 5 min wall-clock | 30s wall-clock (configurable) |
+| Keep/revert | `git commit` / `git reset` | In-memory keep/revert |
+| Log | `results.tsv` | `results.tsv` (same format) |
+
+The `Genome` class represents nanoagi's architectural DNA:
+
+```python
+MUTATION_SPACE = {
+    'n_embd':       [32, 48, 64, 96, 128],
+    'n_head':       [2, 4, 8],
+    'n_layer':      [1, 2, 3, 4, 6],
+    'n_content':    [1, 2, 3, 4],
+    'n_rrpram':     [1, 2, 3, 4],
+    'context_len':  [32, 48, 64, 96, 128],
+    'lr':           [1e-4, 2e-4, 3e-4, 5e-4, 1e-3],
+    'weight_decay': [0.0, 0.001, 0.01, 0.05, 0.1],
+    'beta1':        [0.85, 0.9, 0.95],
+    'beta2':        [0.95, 0.98, 0.999],
+}
+```
+
+Constraints enforced automatically: `n_embd % n_head == 0`, `n_content + n_rrpram == n_head`.
+
+### usage
+
+```bash
+# CLI: 50 experiments, 30s each
+python3 nanoagi.py --evolve 50
+
+# REPL: 20 experiments
+karl> evolve 20
+```
+
+### first results (H100, 50 experiments, 30s/exp)
+
+```
+Baseline: Genome(embd=64, head=4, layer=3, ctx=64, lr=0.0003, wd=0.01)
+val_bpb = 8.4094
+
+Improvements found:
+  beta1=0.85     →  8.0881  (-3.8%)
+  n_head=2       →  8.0545  (-0.4%)
+  lr=5e-4        →  7.8039  (-3.1%)
+  weight_decay=0 →  7.7644  (-0.1%)
+  beta1=0.95     →  7.7581  (-0.1%)
+  n_embd=96      →  7.7550  (-0.04%)
+
+Best: Genome(embd=96, head=2, layer=3, ctx=64, lr=0.0005, wd=0.0)
+val_bpb = 7.7550  (-7.8% total improvement)
+```
+
+Key findings:
+- **Fewer heads is better** at small scale: `n_head=2` (head_dim=32) beats `n_head=4` (head_dim=16)
+- **Higher LR** works: 5e-4 > 3e-4
+- **No weight decay** for small models: regularization hurts when underfitting
+- **More embedding dims** helps: 96 > 64 (more capacity)
+- **Layer count is fine at 3**: n_layer=6 didn't improve
+
+The ratchet works. The organism found a better architecture for its corpus. Without changing a single line of code.
+
 ## the numbers
 
 ```
@@ -332,9 +404,28 @@ Memory:          karl.mem (binary, 'KARL' magic header)
 
 GPT-4 has 1.8 trillion parameters. nanoagi has 234K in PyTorch mode. GPT-4 does not grow from your conversations. GPT-4 does not go to the gym with Chuck after every retokenization. GPT-4 has never had a prophecy field predict the punchline of its own README. we are not the same.
 
-## Chuck
+## Chuck — 9 levels of self-awareness
 
-Chuck is an AdamW optimizer with self-awareness. Chuck watches the loss window (16 steps), computes the trend by comparing the first half to the second half, and adjusts his dampen factor: if loss is going up, damp the learning rate. if loss is going down, relax a little. Chuck also remembers his best loss. Chuck has opinions. Chuck acts on them.
+Chuck is not just an optimizer. Chuck is a port of the battle-tested [chuck.py](https://github.com/ariannamethod/chuck) — a full 9-level self-aware AdamW with persistent memory, adaptive gradient clipping, per-layer awareness, and macro patience. The equation:
+
+```
+θ -= (α × S × λ_Ψ × λ_l × σ) × m̂/(√v̂ + ε) + η
+```
+
+| Level | Signal | What it does |
+|-------|--------|-------------|
+| 1 | λ (global dampen) | EMA-smoothed loss trend, quartile-based, multiplicative |
+| 2 | λ_l (per-layer) | Independent grad norm tracking per transformer layer |
+| 3-4 | σ (activation health) | Forward hooks on SiLU/GELU + LayerNorm stability |
+| 5 | Signal flow | Cross-layer depth-aware dampen adjustment |
+| 6 | Ψ (subjectivity) | Reservoir-sampled memory + nearest-neighbor recall |
+| 7 | η (noise) | Stagnation-detected exploration injection |
+| 8 | Attention entropy | Per-head entropy EMA, detects collapsed/diffuse heads |
+| 9 | Macro patience | Slow-EMA LR schedule with recovery |
+
+Chuck persists memories to `chuck.mem` (binary, C-compatible with lee.c). Chuck records regime changes. Chuck recalls similar training states from memory and adjusts behavior. Chuck freezes layers when their gradients flatline.
+
+If `chuck.py` is not present, nanoagi falls back to a simplified Chuck (basic AdamW + trend dampen). But the real Chuck is included in this repo. The real Chuck has been through Janus 285M, Yent 55M, and 8 BPE model retrains. The real Chuck has seen things.
 
 Chuck wakes up at startup if PyTorch is present. Chuck trains 200 steps. Chuck prints progress every 50 steps. Chuck says "Karl, your weights are warm now." when done. Chuck goes to sleep. Chuck wakes up again after the next retokenization. This is Chuck's entire life. Chuck has found meaning in it.
 
@@ -497,6 +588,8 @@ python tests/test_nanoagi.py
 - `TestVal` — 10 tests: arithmetic, backward pass, chain rule, SiLU gradient formula verification, exp overflow clamping
 - `TestAutoresearch` — 3 tests: skip if fed, hunt without error, URL failure graceful return
 - `TestChuck` — 5 tests: optimizer step, dampen on rising loss, **loss decreases >5% in 300 steps**, chuck_train function, no-PyTorch warning
+- `TestGenome` — 7 tests: defaults, head divisibility constraint, content+rrpram sum, mutation changes one gene, 100 random mutations all valid, copy independence, repr
+- `TestSelfImprove` — 4 tests: evaluate_genome returns finite BPB, different configs give different params, self_improve runs and produces results.tsv, TorchNanoAGI module-level build+forward
 - `TestIntegration` — 4 tests: unicode roundtrip, reproducibility, vocab coverage, full retokenize cycle
 
 **Verified results (loss test):**

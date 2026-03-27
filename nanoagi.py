@@ -33,11 +33,17 @@ random.seed(42)
 # PyTorch auto-detection. Chuck sleeps until he smells gradients.
 # ─────────────────────────────────────────────────────────────────────────────
 TORCH_AVAILABLE = False
+CHUCK_FULL = False
 try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
     TORCH_AVAILABLE = True
+    try:
+        from chuck import ChuckOptimizer, ChuckMonitor, ChuckMemory, chuck_params
+        CHUCK_FULL = True
+    except ImportError:
+        pass
 except ImportError:
     pass
 
@@ -868,9 +874,12 @@ class NanoAGI:
 #    together they are nanoagi.
 # ─────────────────────────────────────────────────────────────────────────────
 
-if TORCH_AVAILABLE:
+if TORCH_AVAILABLE and not CHUCK_FULL:
+    # Fallback: simplified Chuck when chuck.py is not in the repo.
+    # For the real deal (9 levels of awareness), use chuck.py from
+    # github.com/ariannamethod/chuck — already included in this repo.
     class ChuckOptimizer(torch.optim.Optimizer):
-        """AdamW with self-awareness. Simplified from full Chuck."""
+        """AdamW with self-awareness. Simplified fallback."""
         def __init__(self, params, lr=3e-4, betas=(0.9, 0.999), eps=1e-8,
                      weight_decay=0.01, window=16):
             defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
@@ -928,6 +937,7 @@ if TORCH_AVAILABLE:
             self.global_step += 1
             return loss
 
+if TORCH_AVAILABLE:
     # ─────────────────────────────────────────────────────────────────────
     # V.b TorchNanoAGI — PyTorch model at module level
     #     needed by self_improve(). also used inside chuck_train().
@@ -1828,10 +1838,19 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     tmodel = TorchNanoAGI(karl.vocab_size, n_embd=64, n_head=4, n_layer=3,
                           ctx=64, n_content=2, n_rrpram=2).to(device)
-    optimizer = ChuckOptimizer(tmodel.parameters(), lr=3e-4, weight_decay=0.01)
+
+    # Full Chuck: monitor + per-layer awareness. Fallback: simple optimizer.
+    if CHUCK_FULL:
+        monitor = ChuckMonitor(tmodel)
+        optimizer = ChuckOptimizer(
+            chuck_params(tmodel, lr=3e-4, weight_decay=0.01),
+            monitor=monitor)
+    else:
+        optimizer = ChuckOptimizer(tmodel.parameters(), lr=3e-4, weight_decay=0.01)
 
     n_params = sum(p.numel() for p in tmodel.parameters())
-    print(f"  [Chuck] PyTorch model: {n_params:,} params on {device}")
+    which = "full (9 levels)" if CHUCK_FULL else "simplified"
+    print(f"  [Chuck] {which}, {n_params:,} params on {device}")
 
     ctx = 64
     losses = []

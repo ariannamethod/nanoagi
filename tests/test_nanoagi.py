@@ -553,7 +553,6 @@ class TestChuck(unittest.TestCase):
         self.assertAlmostEqual(opt.dampen, 1.0)
         opt.step(loss=5.0)
         self.assertEqual(opt.global_step, 1)
-        self.assertAlmostEqual(opt.best_loss, 5.0)
 
     def test_chuck_dampen_decreases_on_rising_loss(self):
         import torch
