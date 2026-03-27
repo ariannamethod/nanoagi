@@ -375,6 +375,97 @@ Key findings:
 
 The ratchet works. The organism found a better architecture for its corpus. Without changing a single line of code.
 
+## co-evolution — data and architecture evolve together
+
+`self_improve` mutates architecture on fixed data. `autoresearch_hunt` mutates data on fixed architecture. `coevolve` does **both at once**:
+
+```
+Round N:
+  1. Karl hunts new data from climbmix (autoresearch_hunt)
+  2. Re-tokenize corpus with new data
+  3. Evolve architecture on updated corpus (short self_improve)
+  4. Repeat — architecture adapts to new data
+```
+
+The data shapes the organism. The organism shapes the data. Co-evolution.
+
+```bash
+# CLI
+python3 nanoagi.py --coevolve
+
+# REPL
+karl> coevolve
+```
+
+Karpathy's autoresearch changes code on fixed data. nanoagi's coevolve changes **both data AND architecture**. Together.
+
+## self-code — the organism rewrites itself
+
+This is the part where it gets real.
+
+`self_code` reads nanoagi's own source code, sends it to [Qwen2.5-Coder-7B](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct) via HuggingFace Inference API, receives a code improvement suggestion as a JSON patch, applies it to the source file, runs the test suite, and **keeps the change if tests pass**.
+
+The organism reads itself. Asks an LLM for advice. Applies the advice. Verifies it works. Code that writes itself. Not a metaphor.
+
+```bash
+# CLI (needs HF_TOKEN env var)
+export HF_TOKEN=hf_...
+python3 nanoagi.py --self-code
+
+# REPL
+karl> selfcode
+```
+
+### first successful self-code (2026-03-27)
+
+```
+============================================================
+  SELF-CODE — the organism improves its own source
+  LLM: Qwen/Qwen2.5-Coder-7B-Instruct
+  Source: 2326 lines, 11390 chars sent
+============================================================
+
+  [SELF-CODE] Attempt 1/3
+  [SELF-CODE] Suggestion: Increase the batch size during evaluation
+              to better capture model performance.
+  [SELF-CODE] old_code not found in source. Retrying.
+
+  [SELF-CODE] Attempt 2/3
+  [SELF-CODE] Suggestion: Ensure consistent batch size during evaluation.
+  [SELF-CODE] Patch applied.
+  [SELF-CODE] Tests PASS. Keeping patch.
+
+Result: {'description': 'Ensure consistent batch size during evaluation.',
+         'old_code': '        _, loss = tmodel(x, y)',
+         'new_code': '        logits, loss = tmodel(x, y)',
+         'status': 'applied'}
+```
+
+Qwen read nanoagi. Qwen suggested a change. nanoagi applied it. 76 tests passed. The change stayed.
+
+The safety loop:
+1. **Backup** source before any patch
+2. **Apply** the LLM's suggestion
+3. **Run all tests** (`pytest tests/ -q --tb=no`)
+4. Tests pass → **keep**. Tests fail → **revert to backup**.
+5. Repeat up to `max_attempts`
+
+The LLM is configurable — `model_id` parameter accepts any chat model on HuggingFace. The prompt is hardcoded: "suggest ONE small, concrete improvement, return JSON with old_code/new_code." Zero local dependencies — just `urllib` hitting `router.huggingface.co`.
+
+### the levels of autonomy
+
+| Level | Command | What the organism does |
+|-------|---------|----------------------|
+| 0 | `python3 nanoagi.py` | Boot, tokenize, build metaweights, train |
+| 1 | `autoresearch` | **Hunt for data** autonomously from climbmix |
+| 2 | `evolve` | **Mutate its own genome** (architecture hyperparameters) |
+| 3 | `coevolve` | **Data and architecture evolve together** |
+| 4 | `selfcode` | **Read its own source, ask an LLM to improve it, apply the patch** |
+
+Level 0 is a transformer. Level 1 is a transformer that feeds itself. Level 2 is a transformer that redesigns itself. Level 3 is a transformer that redesigns itself while choosing its own training data. Level 4 is a transformer that asks another AI to rewrite its source code.
+
+At no level does it ask for permission.
+
 ## the numbers
 
 ```
