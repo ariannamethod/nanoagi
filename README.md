@@ -452,6 +452,68 @@ The safety loop:
 
 The LLM is configurable — `model_id` parameter accepts any chat model on HuggingFace. The prompt is hardcoded: "suggest ONE small, concrete improvement, return JSON with old_code/new_code." Zero local dependencies — just `urllib` hitting `router.huggingface.co`.
 
+### horizontal gene transfer — autonomous self-code trigger
+
+`selfcode` doesn't have to be called manually. When `evolve` detects **stagnation** (10 experiments without improvement), it autonomously calls `self_code()` — the organism decides for itself that its genome mutations are exhausted and it needs external help.
+
+```
+evolve running...
+  [SELF] Exp 31: no gain. Reverting.
+  [SELF] Exp 32: no gain. Reverting.
+  ...
+  [SELF] 10 experiments without improvement.
+  [SELF] Genome mutations exhausted. Calling self_code()...
+  [SELF] (horizontal gene transfer: pulling code from Qwen)
+  [SELF-CODE] Attempt 1/2
+  [SELF-CODE] Suggestion: Add learning rate warmup to training loop.
+  [SELF-CODE] Patch applied.
+  [SELF-CODE] Tests PASS. Keeping patch.
+  [SELF] Code improved by Qwen. Resuming evolution.
+  [SELF] Exp 33: n_layer = 3 -> 4
+  [SELF] IMPROVED! ...
+```
+
+Like horizontal gene transfer in bacteria: when your own mutations can't save you, pull DNA from outside. Bacteria have done this for 4 billion years. nanoagi learned it today.
+
+Configurable: `stagnation_threshold=10`, `auto_self_code=True`. Requires `HF_TOKEN` env var — without it, the organism skips the call and continues mutating.
+
+## swarm — release the hyenas
+
+Not full copies of itself — mini-agents. Hyenas. Each gets a unique random seed, explores a different part of the genome space **in parallel**. The pack shares findings. The best result wins.
+
+```bash
+# CLI: 4 hyenas (default)
+python3 nanoagi.py --swarm 4
+
+# REPL
+karl> swarm 6
+```
+
+```
+============================================================
+  SWARM — releasing 4 hyenas
+  mutations/hyena: 10, train: 15s/exp
+============================================================
+  [SWARM] Releasing hyena-0 (seed=670487)
+  [SWARM] Releasing hyena-1 (seed=116739)
+  [SWARM] Releasing hyena-2 (seed=334201)
+  [SWARM] Releasing hyena-3 (seed=892456)
+
+  [SWARM] hyena-0: bpb=7.0665 Genome(embd=64, head=4, ..., wd=0.05)
+  [SWARM] hyena-1: bpb=7.1005 Genome(embd=64, head=4, ..., wd=0.01)
+  [SWARM] hyena-2: bpb=6.9821 Genome(embd=96, head=2, ..., wd=0.0) <-- pack leader
+  [SWARM] hyena-3: bpb=7.2103 Genome(embd=48, head=2, ..., wd=0.001)
+
+============================================================
+  SWARM COMPLETE — 4 hyenas returned
+  Pack leader: hyena-2 (bpb=6.9821)
+  Best genome: Genome(embd=96, head=2, ...)
+  Time: 45s (vs ~180s sequential)
+============================================================
+```
+
+Each hyena is a Python thread. PyTorch releases the GIL during tensor operations, so there IS real parallelism — especially on GPU. Karpathy dreams of "swarm of agents emulating a research community." We built it. We called them hyenas. Because hyenas hunt in packs.
+
 ### the levels of autonomy
 
 | Level | Command | What the organism does |
@@ -461,8 +523,10 @@ The LLM is configurable — `model_id` parameter accepts any chat model on Huggi
 | 2 | `evolve` | **Mutate its own genome** (architecture hyperparameters) |
 | 3 | `coevolve` | **Data and architecture evolve together** |
 | 4 | `selfcode` | **Read its own source, ask an LLM to improve it, apply the patch** |
+| 4+ | *(automatic)* | **Stagnation in evolve triggers selfcode autonomously** (horizontal gene transfer) |
+| 5 | `swarm` | **Release hyenas** — parallel genome exploration, pack shares findings |
 
-Level 0 is a transformer. Level 1 is a transformer that feeds itself. Level 2 is a transformer that redesigns itself. Level 3 is a transformer that redesigns itself while choosing its own training data. Level 4 is a transformer that asks another AI to rewrite its source code.
+Level 0 is a transformer. Level 1 is a transformer that feeds itself. Level 2 is a transformer that redesigns itself. Level 3 is a transformer that redesigns itself while choosing its own training data. Level 4 is a transformer that asks another AI to rewrite its source code. Level 4+ is a transformer that *decides for itself* when to ask. Level 5 is a pack of transformers doing all of the above in parallel.
 
 At no level does it ask for permission.
 
