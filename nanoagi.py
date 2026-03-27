@@ -1452,7 +1452,7 @@ def _evaluate_genome(karl, token_ids, genome, train_seconds=30, device=None):
         y = torch.tensor([train_ids[i+1:i+ctx+1]], dtype=torch.long, device=device)
         if x.shape[1] < ctx or y.shape[1] < ctx:
             continue
-        _, loss = tmodel(x, y)
+        logits, loss = tmodel(x, y)
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(tmodel.parameters(), 1.0)
@@ -1772,18 +1772,17 @@ def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
     for attempt in range(max_attempts):
         print(f"\n  [SELF-CODE] Attempt {attempt+1}/{max_attempts}")
 
-        # Call HF Inference API
-        url = f"https://api-inference.huggingface.co/models/{model_id}"
+        # Call HF Inference API (OpenAI-compatible chat endpoint)
+        url = "https://router.huggingface.co/v1/chat/completions"
         payload = _json.dumps({
-            "inputs": f"<|im_start|>system\n{SELF_CODE_PROMPT}<|im_end|>\n"
-                      f"<|im_start|>user\nHere is the source code:\n\n"
-                      f"```python\n{context}\n```\n<|im_end|>\n"
-                      f"<|im_start|>assistant\n",
-            "parameters": {
-                "max_new_tokens": 500,
-                "temperature": 0.7,
-                "return_full_text": False,
-            }
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": SELF_CODE_PROMPT},
+                {"role": "user", "content": f"Here is the source code:\n\n"
+                 f"```python\n{context}\n```"}
+            ],
+            "max_tokens": 800,
+            "temperature": 0.7,
         }).encode('utf-8')
 
         try:
@@ -1791,20 +1790,15 @@ def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
             req.add_header('Authorization', f'Bearer {hf_token}')
             req.add_header('Content-Type', 'application/json')
             req.add_header('User-Agent', 'nanoagi/1.0 (self-code)')
-            response = urlopen(req, timeout=60, context=ctx)
+            response = urlopen(req, timeout=90, context=ctx)
             result = _json.loads(response.read().decode('utf-8'))
         except Exception as e:
             print(f"  [SELF-CODE] API error: {e}")
             continue
 
-        # Parse response
+        # Parse response from OpenAI-compatible format
         try:
-            if isinstance(result, list) and result:
-                text = result[0].get('generated_text', '')
-            elif isinstance(result, dict):
-                text = result.get('generated_text', '')
-            else:
-                text = str(result)
+            text = result['choices'][0]['message']['content']
 
             # Extract JSON from response
             start = text.find('{')
