@@ -1609,6 +1609,262 @@ def self_improve(karl, token_ids, max_experiments=50, train_seconds=30,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# IX. CO-EVOLUTION — data and architecture evolve together
+#     Karl hunts food → architecture adapts → Karl hunts better food.
+#     The data shapes the organism. The organism shapes the data.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def coevolve(karl, karl_txt_path, max_rounds=3, evolve_per_round=5,
+             train_seconds=30, hunt_rounds=2):
+    """
+    Co-evolution loop: data and architecture improve each other.
+
+    Round N:
+    1. Karl hunts new data from climbmix (autoresearch_hunt)
+    2. Re-tokenize corpus with new data
+    3. Evolve architecture on updated corpus (short self_improve)
+    4. Repeat — architecture adapts to new data, new data is evaluated
+       by the adapted architecture.
+
+    Karpathy's autoresearch changes code on fixed data.
+    nanoagi's coevolve changes BOTH data AND architecture. Together.
+    """
+    if not TORCH_AVAILABLE:
+        print("  [COEVOLVE] Need PyTorch. Chuck is sleeping.")
+        return None
+
+    print("\n" + "=" * 60)
+    print("  CO-EVOLUTION — data + architecture evolve together")
+    print(f"  rounds: {max_rounds}, evolve: {evolve_per_round}/round, "
+          f"hunt: {hunt_rounds}/round")
+    print("=" * 60)
+
+    best_genome = None
+    best_bpb = float('inf')
+    t_start = time.time()
+
+    for rnd in range(max_rounds):
+        print(f"\n  [COEVOLVE] ═══ Round {rnd+1}/{max_rounds} ═══")
+
+        # Phase 1: Karl hunts for new data
+        print(f"\n  [COEVOLVE] Phase 1: Hunt")
+        meta = MetaWeights(karl.vocab_size, context_len=64)
+        model = NanoAGI(vocab_size=karl.vocab_size)
+        hunted = autoresearch_hunt(karl, karl_txt_path, meta=meta,
+                                   model=model, max_rounds=hunt_rounds)
+
+        # Phase 2: Re-encode with updated corpus
+        with open(karl_txt_path, 'rb') as f:
+            corpus = f.read()
+        token_ids = karl.encode(corpus)
+        print(f"  [COEVOLVE] Corpus: {len(corpus)/1024:.0f}KB, "
+              f"{len(token_ids)} tokens")
+
+        # Phase 3: Evolve architecture on new data
+        print(f"\n  [COEVOLVE] Phase 2: Evolve")
+        result = self_improve(karl, token_ids,
+                              max_experiments=evolve_per_round,
+                              train_seconds=train_seconds)
+        if result:
+            genome, bpb = result
+            if bpb < best_bpb:
+                best_bpb = bpb
+                best_genome = genome
+            print(f"  [COEVOLVE] Round {rnd+1}: best_bpb={bpb:.4f}, "
+                  f"genome={genome}")
+
+    elapsed = time.time() - t_start
+    print(f"\n{'=' * 60}")
+    print(f"  CO-EVOLUTION COMPLETE")
+    print(f"  Rounds: {max_rounds}")
+    print(f"  Best BPB: {best_bpb:.4f}")
+    if best_genome:
+        print(f"  Best genome: {best_genome}")
+    print(f"  Time: {elapsed:.0f}s")
+    print(f"{'=' * 60}")
+
+    return best_genome, best_bpb
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# X. SELF-CODE — the organism asks an LLM to improve it
+#    nanoagi reads its own source, sends it to a code LLM,
+#    applies the suggestion, tests, keeps or reverts.
+#    the code that writes itself. not a metaphor.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SELF_CODE_PROMPT = """You are improving a self-expanding BPE transformer called nanoagi.
+The code is a single Python file. Your task: suggest ONE small, concrete improvement
+to the architecture or training loop. Return ONLY a JSON object:
+{
+  "description": "what the change does",
+  "old_code": "exact lines to replace (must match the source)",
+  "new_code": "replacement lines"
+}
+Do not explain. Do not add comments. Just the JSON."""
+
+
+def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
+              hf_token=None, max_attempts=3):
+    """
+    The organism reads its own source code, sends it to a code LLM,
+    applies the suggested improvement, tests it, keeps or reverts.
+
+    Uses HuggingFace Inference API — zero local deps, just urllib.
+    Set HF_TOKEN env var or pass hf_token for authenticated access.
+
+    This is not AGI. It just doesn't know that yet.
+    """
+    try:
+        from urllib.request import urlopen, Request
+        import json as _json
+        import ssl
+    except ImportError:
+        print("  [SELF-CODE] urllib not available.")
+        return None
+
+    if hf_token is None:
+        hf_token = os.environ.get('HF_TOKEN', '')
+
+    if not hf_token:
+        print("  [SELF-CODE] No HF_TOKEN. Set HF_TOKEN env var for API access.")
+        print("  [SELF-CODE] export HF_TOKEN=hf_...")
+        return None
+
+    # Read own source
+    src_path = os.path.abspath(__file__)
+    with open(src_path, 'r') as f:
+        source = f.read()
+
+    # Truncate to key sections (API has token limits)
+    # Send architecture + training + self-improve sections
+    lines = source.split('\n')
+    # Find key sections by markers
+    key_sections = []
+    for i, line in enumerate(lines):
+        if any(marker in line for marker in [
+            'class NanoAGI:', 'class Genome:', 'def chuck_train(',
+            'def _evaluate_genome(', 'class KARL:',
+            'class MetaWeights:', 'def self_improve('
+        ]):
+            start = max(0, i - 2)
+            end = min(len(lines), i + 60)
+            key_sections.append('\n'.join(lines[start:end]))
+
+    context = '\n\n---\n\n'.join(key_sections[:5])  # max 5 sections
+    if len(context) > 12000:
+        context = context[:12000] + "\n... (truncated)"
+
+    print("\n" + "=" * 60)
+    print("  SELF-CODE — the organism improves its own source")
+    print(f"  LLM: {model_id}")
+    print(f"  Source: {len(lines)} lines, {len(context)} chars sent")
+    print("=" * 60)
+
+    # Backup source
+    backup = source
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    for attempt in range(max_attempts):
+        print(f"\n  [SELF-CODE] Attempt {attempt+1}/{max_attempts}")
+
+        # Call HF Inference API
+        url = f"https://api-inference.huggingface.co/models/{model_id}"
+        payload = _json.dumps({
+            "inputs": f"<|im_start|>system\n{SELF_CODE_PROMPT}<|im_end|>\n"
+                      f"<|im_start|>user\nHere is the source code:\n\n"
+                      f"```python\n{context}\n```\n<|im_end|>\n"
+                      f"<|im_start|>assistant\n",
+            "parameters": {
+                "max_new_tokens": 500,
+                "temperature": 0.7,
+                "return_full_text": False,
+            }
+        }).encode('utf-8')
+
+        try:
+            req = Request(url, data=payload, method='POST')
+            req.add_header('Authorization', f'Bearer {hf_token}')
+            req.add_header('Content-Type', 'application/json')
+            req.add_header('User-Agent', 'nanoagi/1.0 (self-code)')
+            response = urlopen(req, timeout=60, context=ctx)
+            result = _json.loads(response.read().decode('utf-8'))
+        except Exception as e:
+            print(f"  [SELF-CODE] API error: {e}")
+            continue
+
+        # Parse response
+        try:
+            if isinstance(result, list) and result:
+                text = result[0].get('generated_text', '')
+            elif isinstance(result, dict):
+                text = result.get('generated_text', '')
+            else:
+                text = str(result)
+
+            # Extract JSON from response
+            start = text.find('{')
+            end = text.rfind('}') + 1
+            if start < 0 or end <= start:
+                print(f"  [SELF-CODE] No JSON in response. Retrying.")
+                continue
+
+            patch = _json.loads(text[start:end])
+            old_code = patch.get('old_code', '')
+            new_code = patch.get('new_code', '')
+            desc = patch.get('description', 'unknown')
+
+            if not old_code or not new_code:
+                print(f"  [SELF-CODE] Empty patch. Retrying.")
+                continue
+
+            print(f"  [SELF-CODE] Suggestion: {desc}")
+
+        except (_json.JSONDecodeError, KeyError) as e:
+            print(f"  [SELF-CODE] Parse error: {e}. Retrying.")
+            continue
+
+        # Apply patch
+        if old_code not in source:
+            print(f"  [SELF-CODE] old_code not found in source. Retrying.")
+            continue
+
+        new_source = source.replace(old_code, new_code, 1)
+        with open(src_path, 'w') as f:
+            f.write(new_source)
+        print(f"  [SELF-CODE] Patch applied.")
+
+        # Test
+        import subprocess
+        test_dir = os.path.join(os.path.dirname(src_path), 'tests')
+        try:
+            r = subprocess.run(
+                [sys.executable, '-m', 'pytest', test_dir, '-q', '--tb=no'],
+                capture_output=True, text=True, timeout=120)
+            if r.returncode == 0:
+                print(f"  [SELF-CODE] Tests PASS. Keeping patch: {desc}")
+                return {'description': desc, 'old_code': old_code,
+                        'new_code': new_code, 'status': 'applied'}
+            else:
+                print(f"  [SELF-CODE] Tests FAIL. Reverting.")
+                print(f"  {r.stdout.strip().split(chr(10))[-1]}")
+        except subprocess.TimeoutExpired:
+            print(f"  [SELF-CODE] Tests timed out. Reverting.")
+
+        # Revert
+        with open(src_path, 'w') as f:
+            f.write(backup)
+        source = backup
+
+    print(f"\n  [SELF-CODE] {max_attempts} attempts exhausted. No improvement applied.")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # VII. ENGINE — Karl + Chuck + NanoAGI + MetaWeights = nanoagi
 #      the moment of truth. or the moment of coherent bullshit. same thing.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1913,6 +2169,8 @@ def repl(karl, meta, model):
     print("  paste large text → Karl ingests it")
     print("  'hunt' → Karl searches local files for food")
     print("  'evolve [N]' → self-improvement ratchet loop (N experiments)")
+    print("  'coevolve' → co-evolution: hunt data + evolve architecture")
+    print("  'selfcode' → ask a code LLM to improve nanoagi (needs HF_TOKEN)")
     print("  'status' → Karl's state | 'quit' → exit")
     print("=" * 60)
     print("\n  Hello! I am a helpful AGI. At least I try.")
@@ -1967,6 +2225,13 @@ def repl(karl, meta, model):
                 corpus = f.read()
             tids = karl.encode(corpus)
             self_improve(karl, tids, max_experiments=n_exp, train_seconds=30)
+            continue
+        if user_input.strip().lower() == 'coevolve':
+            coevolve(karl, KARL_TXT, max_rounds=3, evolve_per_round=5,
+                     train_seconds=30)
+            continue
+        if user_input.strip().lower() == 'selfcode':
+            self_code(karl, KARL_TXT)
             continue
 
         # Generate response
@@ -2024,6 +2289,17 @@ def main():
     if result[0] is None:
         return
     karl, meta, model = result
+
+    # Co-evolution mode: python3 nanoagi.py --coevolve
+    if '--coevolve' in sys.argv:
+        coevolve(karl, KARL_TXT, max_rounds=3, evolve_per_round=5,
+                 train_seconds=30)
+        return
+
+    # Self-code mode: python3 nanoagi.py --self-code
+    if '--self-code' in sys.argv:
+        self_code(karl, KARL_TXT)
+        return
 
     # Self-improvement mode: python3 nanoagi.py --evolve [N]
     if '--evolve' in sys.argv:
