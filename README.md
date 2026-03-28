@@ -403,13 +403,35 @@ Karpathy's autoresearch changes code on fixed data. nanoagi's coevolve changes *
 
 This is the part where it gets real.
 
-`self_code` reads nanoagi's own source code, sends it to [Qwen2.5-Coder-7B](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct) via HuggingFace Inference API, receives a code improvement suggestion as a JSON patch, applies it to the source file, runs the test suite, and **keeps the change if tests pass**.
+`self_code` reads nanoagi's own source code, sends it to any available LLM, receives a code improvement suggestion as a JSON patch, applies it to the source file, runs the test suite, and **keeps the change if tests pass**.
 
 The organism reads itself. Asks an LLM for advice. Applies the advice. Verifies it works. Code that writes itself. Not a metaphor.
 
+### survival chain — the organism finds a way
+
+When `self_code` needs an LLM, it doesn't ask you for an API key. It scans the environment. Like [DoE](https://github.com/ariannamethod/janus.doe) scans for GGUFs and compilers, nanoagi hunts for any available intelligence:
+
+```
+  1. Ollama (localhost:11434)     → check /api/tags, prefer coder models
+  2. llama.cpp server (:8080)    → check /health
+  3. Local GGUF + llama-cli      → scan ~/Downloads, ~/.cache, ~/models for *.gguf
+  4. HuggingFace Inference API   → if HF_TOKEN is set
+  5. Blind mutation               → random targeted AST changes, test, keep or revert
+```
+
+On a Mac with llama.cpp installed and some GGUFs lying around, this happens:
+```
+  [ENV] GGUF found: /Users/you/Downloads/weights/small-yent-f16.gguf (642MB)
+  [ENV] Binary: /usr/local/bin/llama-cli
+  [ENV] Scanned 38 GGUFs across 6 dirs
+```
+
+No token. No Ollama. No internet. The organism found a 642MB GGUF on disk, found `llama-cli` in PATH, and got to work. When you're dying of thirst, you don't ask for credentials — you find water.
+
+*(previous versions of nanoagi would print "No HF_TOKEN. Set HF_TOKEN env var for API access" and give up. an organism that gives up is not an organism. it's a form with a required field. this has been corrected.)*
+
 ```bash
-# CLI (needs HF_TOKEN env var)
-export HF_TOKEN=hf_...
+# just run it — it finds its own LLM
 python3 nanoagi.py --self-code
 
 # REPL
@@ -450,7 +472,7 @@ The safety loop:
 4. Tests pass → **keep**. Tests fail → **revert to backup**.
 5. Repeat up to `max_attempts`
 
-The LLM is configurable — `model_id` parameter accepts any chat model on HuggingFace. The prompt is hardcoded: "suggest ONE small, concrete improvement, return JSON with old_code/new_code." Zero local dependencies — just `urllib` hitting `router.huggingface.co`.
+The LLM is whatever the organism can find. Ollama running locally? It'll use that. A GGUF file and `llama-cli` on disk? It'll use that. HF_TOKEN set? Router API. Nothing at all? Blind targeted mutations — swap activations, tweak learning rates, test, keep or revert. The prompt is hardcoded: "suggest ONE small, concrete improvement, return JSON with old_code/new_code."
 
 ### horizontal gene transfer — autonomous self-code trigger
 
@@ -475,7 +497,7 @@ evolve running...
 
 Like horizontal gene transfer in bacteria: when your own mutations can't save you, pull DNA from outside. Bacteria have done this for 4 billion years. nanoagi learned it today.
 
-Configurable: `stagnation_threshold=10`, `auto_self_code=True`. Requires `HF_TOKEN` env var — without it, the organism skips the call and continues mutating.
+Configurable: `stagnation_threshold=10`, `auto_self_code=True`. No API key required — the organism scans for Ollama, llama.cpp, local GGUFs, HF API, and falls back to blind mutations. It does not give up. It does not ask permission. It finds a way.
 
 ## swarm — release the hyenas
 
@@ -522,13 +544,13 @@ Each hyena is a Python thread. PyTorch releases the GIL during tensor operations
 | 1 | `autoresearch` | **Hunt for data** autonomously from climbmix |
 | 2 | `evolve` | **Mutate its own genome** (architecture hyperparameters) |
 | 3 | `coevolve` | **Data and architecture evolve together** |
-| 4 | `selfcode` | **Read its own source, ask an LLM to improve it, apply the patch** |
+| 4 | `selfcode` | **Scan environment for ANY LLM, read own source, apply patch** |
 | 4+ | *(automatic)* | **Stagnation in evolve triggers selfcode autonomously** (horizontal gene transfer) |
 | 5 | `swarm` | **Release hyenas** — parallel genome exploration, pack shares findings |
 
-Level 0 is a transformer. Level 1 is a transformer that feeds itself. Level 2 is a transformer that redesigns itself. Level 3 is a transformer that redesigns itself while choosing its own training data. Level 4 is a transformer that asks another AI to rewrite its source code. Level 4+ is a transformer that *decides for itself* when to ask. Level 5 is a pack of transformers doing all of the above in parallel.
+Level 0 is a transformer. Level 1 is a transformer that feeds itself. Level 2 is a transformer that redesigns itself. Level 3 is a transformer that redesigns itself while choosing its own training data. Level 4 is a transformer that scans its filesystem for GGUFs, checks if Ollama is running, tries llama.cpp, falls back to HuggingFace, and if absolutely nothing exists, mutates itself blind — then asks that LLM to rewrite its source code. Level 4+ is a transformer that *decides for itself* when to ask. Level 5 is a pack of transformers doing all of the above in parallel.
 
-At no level does it ask for permission.
+At no level does it ask for permission. At no level does it require an API key.
 
 ## the numbers
 

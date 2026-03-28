@@ -1586,16 +1586,17 @@ def self_improve(karl, token_ids, max_experiments=50, train_seconds=30,
         # Stagnation → genome mutations exhausted → ask an LLM for help
         # Like horizontal gene transfer in bacteria: when your own
         # mutations can't save you, pull DNA from outside.
-        if (auto_self_code and stagnant >= stagnation_threshold
-                and os.environ.get('HF_TOKEN', '')):
+        # No token? No problem. The organism scans for Ollama, llama.cpp,
+        # local GGUFs, HF API — whatever it takes. Dying is not an option.
+        if (auto_self_code and stagnant >= stagnation_threshold):
             print(f"\n  [SELF] {stagnant} experiments without improvement.")
             print(f"  [SELF] Genome mutations exhausted. Calling self_code()...")
-            print(f"  [SELF] (horizontal gene transfer: pulling code from Qwen)")
+            print(f"  [SELF] (horizontal gene transfer: pulling DNA from any LLM)")
             sc_result = self_code(karl, KARL_TXT, max_attempts=2)
             if sc_result and sc_result.get('status') == 'applied':
-                print(f"  [SELF] Code improved by Qwen. Resuming evolution.")
+                print(f"  [SELF] Code improved. Resuming evolution.")
             else:
-                print(f"  [SELF] Qwen couldn't help. Continuing mutations.")
+                print(f"  [SELF] No LLM could help. Continuing mutations.")
             stagnant = 0
 
         # Log result
@@ -1836,16 +1837,247 @@ to the architecture or training loop. Return ONLY a JSON object:
 Do not explain. Do not add comments. Just the JSON."""
 
 
+def _blind_mutate(karl, karl_txt_path):
+    """
+    Last resort: no LLM available anywhere. The organism mutates itself
+    using only its own code — random but targeted AST-level changes.
+    Like bacteria mutating without horizontal gene transfer.
+    Slower, dumber, but alive.
+    """
+    import random
+    src_path = os.path.abspath(__file__)
+    with open(src_path, 'r') as f:
+        source = f.read()
+    backup = source
+    lines = source.split('\n')
+
+    # Targeted mutations: things that actually affect training quality
+    mutations = [
+        # learning rate tweaks
+        ('lr=3e-4', f'lr={random.choice(["1e-4", "5e-4", "2e-4", "7e-4"])}'),
+        ('lr = 3e-4', f'lr = {random.choice(["1e-4", "5e-4", "2e-4", "7e-4"])}'),
+        # activation swaps
+        ('torch.nn.functional.gelu', 'torch.nn.functional.silu'),
+        ('torch.nn.functional.silu', 'torch.nn.functional.gelu'),
+        # dropout tweaks
+        ('dropout=0.1', f'dropout={random.choice(["0.05", "0.15", "0.2", "0.0"])}'),
+        # weight init scale
+        ('0.02', f'{random.choice(["0.01", "0.03", "0.05"])}'),
+    ]
+
+    # pick a random mutation that matches
+    random.shuffle(mutations)
+    for old, new in mutations:
+        if old in source and old != new:
+            new_source = source.replace(old, new, 1)
+            with open(src_path, 'w') as f:
+                f.write(new_source)
+            print(f"  [BLIND] Mutation: '{old}' → '{new}'")
+
+            # test
+            import subprocess, sys
+            test_dir = os.path.join(os.path.dirname(src_path), 'tests')
+            try:
+                r = subprocess.run(
+                    [sys.executable, '-m', 'pytest', test_dir, '-q', '--tb=no'],
+                    capture_output=True, text=True, timeout=120)
+                if r.returncode == 0:
+                    print(f"  [BLIND] Tests PASS. Mutation kept.")
+                    return {'description': f'blind: {old} → {new}',
+                            'old_code': old, 'new_code': new, 'status': 'applied'}
+            except Exception:
+                pass
+
+            # revert
+            with open(src_path, 'w') as f:
+                f.write(backup)
+            print(f"  [BLIND] Tests FAIL. Reverted.")
+
+    print(f"  [BLIND] No viable mutations found.")
+    return None
+
+
+def _find_llm():
+    """
+    Scan the environment for any available LLM. Try everything. Die last.
+
+    Returns dict: {'type': 'ollama'|'llamacpp'|'gguf'|'hf'|None,
+                   'url': ..., 'model': ..., 'token': ..., 'gguf_path': ..., 'binary': ...}
+
+    Search order:
+      1. Ollama (localhost:11434) — check /api/tags for models
+      2. llama.cpp server (localhost:8080) — check /health
+      3. Local GGUF + llama-cli binary — scan disk, run inference directly
+      4. HuggingFace Inference API — needs HF_TOKEN
+      5. None — you're on your own. mutate blind.
+    """
+    from urllib.request import urlopen, Request
+    import json as _json
+
+    env = {'type': None, 'url': None, 'model': None, 'token': None,
+           'gguf_path': None, 'binary': None}
+
+    # 1. Ollama
+    try:
+        r = urlopen('http://localhost:11434/api/tags', timeout=3)
+        data = _json.loads(r.read())
+        models = [m['name'] for m in data.get('models', [])]
+        if models:
+            # prefer coder models, then biggest
+            coder = [m for m in models if 'coder' in m.lower() or 'code' in m.lower()]
+            pick = coder[0] if coder else models[0]
+            env.update(type='ollama', url='http://localhost:11434/v1/chat/completions',
+                       model=pick)
+            print(f"  [ENV] Ollama found: {len(models)} models, picked {pick}")
+            return env
+    except Exception:
+        pass
+
+    # 2. llama.cpp server
+    try:
+        r = urlopen('http://localhost:8080/health', timeout=3)
+        if r.status == 200:
+            env.update(type='llamacpp', url='http://localhost:8080/v1/chat/completions',
+                       model='local')
+            print(f"  [ENV] llama.cpp server found at :8080")
+            return env
+    except Exception:
+        pass
+
+    # 3. Local GGUF + binary — scan like DoE does
+    import subprocess, glob
+    # find llama-cli or llama-server binary
+    binary = None
+    for name in ['llama-cli', 'llama-server', 'main', 'llama.cpp/main',
+                 'llama.cpp/build/bin/llama-cli']:
+        try:
+            r = subprocess.run(['which', name], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                binary = r.stdout.strip()
+                break
+        except Exception:
+            pass
+    # also check common install paths
+    if not binary:
+        for p in [os.path.expanduser('~/llama.cpp/build/bin/llama-cli'),
+                  os.path.expanduser('~/llama.cpp/main'),
+                  '/usr/local/bin/llama-cli',
+                  os.path.expanduser('~/.local/bin/llama-cli')]:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                binary = p
+                break
+
+    if binary:
+        # hunt for GGUFs — scan common locations
+        gguf_paths = []
+        scan_dirs = ['.', os.path.expanduser('~/.cache'),
+                     os.path.expanduser('~/Downloads'),
+                     os.path.expanduser('~/models'),
+                     os.path.expanduser('~/.local/share/llama.cpp'),
+                     '/tmp']
+        for d in scan_dirs:
+            gguf_paths.extend(glob.glob(os.path.join(d, '**', '*.gguf'), recursive=True))
+            if len(gguf_paths) > 50:
+                break
+
+        if gguf_paths:
+            # prefer coder/instruct models, then smallest that's >1GB (not tiny)
+            coder = [p for p in gguf_paths
+                     if 'coder' in p.lower() or 'instruct' in p.lower()]
+            if coder:
+                pick = min(coder, key=os.path.getsize)
+            else:
+                big_enough = [p for p in gguf_paths if os.path.getsize(p) > 500_000_000]
+                pick = min(big_enough, key=os.path.getsize) if big_enough else gguf_paths[0]
+
+            env.update(type='gguf', binary=binary, gguf_path=pick)
+            size_mb = os.path.getsize(pick) / (1024 * 1024)
+            print(f"  [ENV] GGUF found: {pick} ({size_mb:.0f}MB)")
+            print(f"  [ENV] Binary: {binary}")
+            print(f"  [ENV] Scanned {len(gguf_paths)} GGUFs across {len(scan_dirs)} dirs")
+            return env
+
+    # 4. HuggingFace API
+    hf_token = os.environ.get('HF_TOKEN', '')
+    if hf_token:
+        env.update(type='hf', url='https://router.huggingface.co/v1/chat/completions',
+                   model='Qwen/Qwen2.5-Coder-7B-Instruct', token=hf_token)
+        print(f"  [ENV] HF_TOKEN found, using HuggingFace Inference API")
+        return env
+
+    # 5. Nothing. The organism is alone.
+    print(f"  [ENV] No LLM found. No Ollama, no llama.cpp, no GGUF, no HF_TOKEN.")
+    print(f"  [ENV] self_code will attempt blind AST mutations.")
+    return env
+
+
+def _llm_chat(llm_env, system_prompt, user_prompt, max_tokens=800, temperature=0.7):
+    """
+    Send a chat completion request to whatever LLM _find_llm() found.
+    Returns the response text, or None on failure.
+    """
+    from urllib.request import urlopen, Request
+    import json as _json
+    import ssl
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    if llm_env['type'] in ('ollama', 'llamacpp', 'hf'):
+        payload = _json.dumps({
+            "model": llm_env['model'],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }).encode('utf-8')
+
+        try:
+            req = Request(llm_env['url'], data=payload, method='POST')
+            req.add_header('Content-Type', 'application/json')
+            req.add_header('User-Agent', 'nanoagi/1.0 (self-code)')
+            if llm_env.get('token'):
+                req.add_header('Authorization', f'Bearer {llm_env["token"]}')
+            timeout = 120 if llm_env['type'] == 'ollama' else 90
+            response = urlopen(req, timeout=timeout, context=ctx)
+            result = _json.loads(response.read().decode('utf-8'))
+            return result['choices'][0]['message']['content']
+        except Exception as e:
+            print(f"  [SELF-CODE] {llm_env['type']} error: {e}")
+            return None
+
+    elif llm_env['type'] == 'gguf':
+        import subprocess, tempfile
+        prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
+        try:
+            r = subprocess.run(
+                [llm_env['binary'], '-m', llm_env['gguf_path'],
+                 '-p', prompt, '-n', str(max_tokens), '--temp', str(temperature),
+                 '-t', str(min(os.cpu_count() or 4, 8)), '--no-display-prompt'],
+                capture_output=True, text=True, timeout=300)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+            else:
+                print(f"  [SELF-CODE] GGUF inference failed: {r.stderr[:200]}")
+                return None
+        except Exception as e:
+            print(f"  [SELF-CODE] GGUF error: {e}")
+            return None
+
+    return None
+
+
 def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
               hf_token=None, max_attempts=3):
     """
     The organism reads its own source code, sends it to a code LLM,
     applies the suggested improvement, tests it, keeps or reverts.
 
-    Uses HuggingFace Inference API — zero local deps, just urllib.
-    Set HF_TOKEN env var or pass hf_token for authenticated access.
-
-    This is not AGI. It just doesn't know that yet.
+    Survival chain: Ollama → llama.cpp → local GGUF → HF API → blind mutation.
+    The organism does not ask permission. It finds a way or makes one.
     """
     try:
         from urllib.request import urlopen, Request
@@ -1855,13 +2087,13 @@ def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
         print("  [SELF-CODE] urllib not available.")
         return None
 
-    if hf_token is None:
-        hf_token = os.environ.get('HF_TOKEN', '')
+    # Scan environment — find ANY available LLM
+    llm = _find_llm()
 
-    if not hf_token:
-        print("  [SELF-CODE] No HF_TOKEN. Set HF_TOKEN env var for API access.")
-        print("  [SELF-CODE] export HF_TOKEN=hf_...")
-        return None
+    if llm['type'] is None:
+        # No LLM anywhere. Blind AST mutation — last resort.
+        print("  [SELF-CODE] No LLM available. Attempting blind mutation.")
+        return _blind_mutate(karl, karl_txt_path)
 
     # Read own source
     src_path = os.path.abspath(__file__)
@@ -1887,50 +2119,26 @@ def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
     if len(context) > 12000:
         context = context[:12000] + "\n... (truncated)"
 
+    llm_name = (f"{llm['type']}:{llm.get('model') or llm.get('gguf_path','?')}")
     print("\n" + "=" * 60)
     print("  SELF-CODE — the organism improves its own source")
-    print(f"  LLM: {model_id}")
+    print(f"  LLM: {llm_name}")
     print(f"  Source: {len(lines)} lines, {len(context)} chars sent")
     print("=" * 60)
 
     # Backup source
     backup = source
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
     for attempt in range(max_attempts):
         print(f"\n  [SELF-CODE] Attempt {attempt+1}/{max_attempts}")
 
-        # Call HF Inference API (OpenAI-compatible chat endpoint)
-        url = "https://router.huggingface.co/v1/chat/completions"
-        payload = _json.dumps({
-            "model": model_id,
-            "messages": [
-                {"role": "system", "content": SELF_CODE_PROMPT},
-                {"role": "user", "content": f"Here is the source code:\n\n"
-                 f"```python\n{context}\n```"}
-            ],
-            "max_tokens": 800,
-            "temperature": 0.7,
-        }).encode('utf-8')
-
-        try:
-            req = Request(url, data=payload, method='POST')
-            req.add_header('Authorization', f'Bearer {hf_token}')
-            req.add_header('Content-Type', 'application/json')
-            req.add_header('User-Agent', 'nanoagi/1.0 (self-code)')
-            response = urlopen(req, timeout=90, context=ctx)
-            result = _json.loads(response.read().decode('utf-8'))
-        except Exception as e:
-            print(f"  [SELF-CODE] API error: {e}")
+        text = _llm_chat(llm, SELF_CODE_PROMPT,
+                         f"Here is the source code:\n\n```python\n{context}\n```")
+        if not text:
             continue
 
-        # Parse response from OpenAI-compatible format
+        # Parse JSON patch from response
         try:
-            text = result['choices'][0]['message']['content']
-
             # Extract JSON from response
             start = text.find('{')
             end = text.rfind('}') + 1
