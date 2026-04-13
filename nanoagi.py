@@ -10,11 +10,11 @@ How it works:
 2. MetaWeights build probability space from token statistics
 3. Dual-attention transformer (Content + RRPRAM) with SwiGLU + RoPE
 4. Weights initialized FROM metaweights (ghost → flesh)
-5. If PyTorch detected: Chuck trains real weights after each retokenization
+5. If notorch detected: Chuck trains real weights after each retokenization
 6. REPL captures user input → karl.txt grows → KARL retokenizes → repeat
 
 No mandatory dependencies. Just math, random, hashlib, os.
-If PyTorch is around, Chuck wakes up. If not, Karl works alone.
+If notorch is around, Chuck wakes up. If not, Karl works alone.
 
 resonance is unbreakable.
 """
@@ -30,20 +30,16 @@ import time
 random.seed(42)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PyTorch auto-detection. Chuck sleeps until he smells gradients.
+# notorch auto-detection. Chuck sleeps until he smells gradients.
 # ─────────────────────────────────────────────────────────────────────────────
-TORCH_AVAILABLE = False
-CHUCK_FULL = False
+NOTORCH_AVAILABLE = False
+TORCH_AVAILABLE = False  # compat alias
 try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    TORCH_AVAILABLE = True
-    try:
-        from chuck import ChuckOptimizer, ChuckMonitor, ChuckMemory, chuck_params
-        CHUCK_FULL = True
-    except ImportError:
-        pass
+    from ariannamethod.notorch_nn import (
+        NotorchNanoAGI, NotorchEngine, seed as nt_seed
+    )
+    NOTORCH_AVAILABLE = True
+    TORCH_AVAILABLE = True  # compat alias — all code now uses NOTORCH_AVAILABLE
 except ImportError:
     pass
 
@@ -874,182 +870,8 @@ class NanoAGI:
 #    together they are nanoagi.
 # ─────────────────────────────────────────────────────────────────────────────
 
-if TORCH_AVAILABLE and not CHUCK_FULL:
-    # Fallback: simplified Chuck when chuck.py is not in the repo.
-    # For the real deal (9 levels of awareness), use chuck.py from
-    # github.com/ariannamethod/chuck — already included in this repo.
-    class ChuckOptimizer(torch.optim.Optimizer):
-        """AdamW with self-awareness. Simplified fallback."""
-        def __init__(self, params, lr=3e-4, betas=(0.9, 0.999), eps=1e-8,
-                     weight_decay=0.01, window=16):
-            defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-            super().__init__(params, defaults)
-            self.window = window
-            self._hist = [0.0] * window
-            self._hpos = 0
-            self._hfull = False
-            self.dampen = 1.0
-            self.best_loss = float('inf')
-            self.global_step = 0
-
-        @torch.no_grad()
-        def step(self, loss=None):
-            if loss is None:
-                loss = 0.0
-            self._hist[self._hpos] = loss
-            self._hpos = (self._hpos + 1) % self.window
-            if not self._hfull and self._hpos == 0:
-                self._hfull = True
-            if self._hfull:
-                half = self.window // 2
-                recent = sum(self._hist[half:]) / half
-                old = sum(self._hist[:half]) / half
-                trend = recent - old
-                if trend > 0.02:
-                    self.dampen = max(0.5, self.dampen - 0.05)
-                elif trend < -0.02:
-                    self.dampen = min(1.5, self.dampen + 0.05)
-            self.dampen = 0.999 * self.dampen + 0.001
-            if loss < self.best_loss:
-                self.best_loss = loss
-            for group in self.param_groups:
-                lr = group['lr'] * self.dampen
-                beta1, beta2 = group['betas']
-                eps = group['eps']
-                wd = group['weight_decay']
-                for p in group['params']:
-                    if p.grad is None:
-                        continue
-                    grad = p.grad.data
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state['step'] = 0
-                        state['exp_avg'] = torch.zeros_like(p.data)
-                        state['exp_avg_sq'] = torch.zeros_like(p.data)
-                    state['step'] += 1
-                    if wd > 0:
-                        p.data.mul_(1 - lr * wd)
-                    state['exp_avg'].mul_(beta1).add_(grad, alpha=1 - beta1)
-                    state['exp_avg_sq'].mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                    bc1 = 1 - beta1 ** state['step']
-                    bc2 = 1 - beta2 ** state['step']
-                    p.data.addcdiv_(state['exp_avg'] / bc1, state['exp_avg_sq'].sqrt() / bc2 + eps, value=-lr)
-            self.global_step += 1
-            return loss
-
-if TORCH_AVAILABLE:
-    # ─────────────────────────────────────────────────────────────────────
-    # V.b TorchNanoAGI — PyTorch model at module level
-    #     needed by self_improve(). also used inside chuck_train().
-    # ─────────────────────────────────────────────────────────────────────
-
-    class _RMSNorm(nn.Module):
-        def __init__(self, dim, eps=1e-5):
-            super().__init__()
-            self.eps = eps
-            self.weight = nn.Parameter(torch.ones(dim))
-        def forward(self, x):
-            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
-
-    class _Block(nn.Module):
-        def __init__(self, n_embd, n_content, n_rrpram, hd, ctx, n_layer):
-            super().__init__()
-            self.n_embd = n_embd
-            self.n_content = n_content
-            self.n_rrpram = n_rrpram
-            self.hd = hd
-            self.norm1 = _RMSNorm(n_embd)
-            self.wq = nn.Linear(n_embd, n_content * hd, bias=False)
-            self.wk = nn.Linear(n_embd, n_content * hd, bias=False)
-            self.wv_content = nn.Linear(n_embd, n_content * hd, bias=False)
-            self.wr = nn.Parameter(torch.randn(n_rrpram, n_embd, ctx) * 0.02)
-            self.wv_rrpram = nn.Linear(n_embd, n_rrpram * hd, bias=False)
-            self.wo = nn.Linear(n_embd, n_embd, bias=False)
-            nn.init.normal_(self.wo.weight, std=0.02 / math.sqrt(2 * n_layer))
-            self.norm2 = _RMSNorm(n_embd)
-            self.mlp_gate = nn.Linear(n_embd, n_embd * 4, bias=False)
-            self.mlp_up = nn.Linear(n_embd, n_embd * 4, bias=False)
-            self.mlp_down = nn.Linear(n_embd * 4, n_embd, bias=False)
-            nn.init.normal_(self.mlp_down.weight, std=0.02 / math.sqrt(2 * n_layer))
-
-    class TorchNanoAGI(nn.Module):
-        def __init__(self, vocab_size, n_embd=64, n_head=4, n_layer=3, ctx=64,
-                     n_content=2, n_rrpram=2):
-            super().__init__()
-            self.ctx = ctx
-            self.n_embd = n_embd
-            self.n_content = n_content
-            self.n_rrpram = n_rrpram
-            hd = n_embd // n_head
-            self.hd = hd
-            self.wte = nn.Embedding(vocab_size, n_embd)
-            nn.init.normal_(self.wte.weight, std=0.02)
-            self.blocks = nn.ModuleList([
-                _Block(n_embd, n_content, n_rrpram, hd, ctx, n_layer)
-                for _ in range(n_layer)
-            ])
-            self.norm_f = _RMSNorm(n_embd)
-            self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-            self.lm_head.weight = self.wte.weight
-            for block in self.blocks:
-                for name, p in block.named_parameters():
-                    if p.dim() >= 2 and 'wo' not in name and 'mlp_down' not in name and 'wr' not in name:
-                        nn.init.normal_(p, std=0.02)
-            freqs = 1.0 / (10000.0 ** (torch.arange(0, hd, 2).float() / hd))
-            t = torch.arange(ctx).float()
-            angles = torch.outer(t, freqs)
-            self.register_buffer('rope_cos', angles.cos())
-            self.register_buffer('rope_sin', angles.sin())
-
-        def _apply_rope(self, x):
-            T = x.shape[2]
-            cos = self.rope_cos[:T].unsqueeze(0).unsqueeze(0)
-            sin = self.rope_sin[:T].unsqueeze(0).unsqueeze(0)
-            x1 = x[..., ::2]
-            x2 = x[..., 1::2]
-            return torch.stack([x1 * cos - x2 * sin,
-                                x1 * sin + x2 * cos], dim=-1).flatten(-2)
-
-        def forward(self, idx, targets=None):
-            B, T = idx.shape
-            x = self.wte(idx)
-            hd = self.hd
-            mask = torch.triu(torch.ones(T, T, device=idx.device,
-                              dtype=torch.bool), diagonal=1)
-            for block in self.blocks:
-                xn = block.norm1(x)
-                nc = block.n_content
-                nr = block.n_rrpram
-                q = block.wq(xn).view(B, T, nc, hd).transpose(1, 2)
-                k = block.wk(xn).view(B, T, nc, hd).transpose(1, 2)
-                v_c = block.wv_content(xn).view(B, T, nc, hd).transpose(1, 2)
-                q = self._apply_rope(q)
-                k = self._apply_rope(k)
-                c_attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
-                c_attn = c_attn.masked_fill(mask, float('-inf'))
-                c_attn = F.softmax(c_attn, dim=-1)
-                c_out = (c_attn @ v_c).transpose(1, 2).contiguous().view(B, T, nc * hd)
-                v_r = block.wv_rrpram(xn).view(B, T, nr, hd).transpose(1, 2)
-                r_outs = []
-                for h in range(nr):
-                    r_score = xn @ block.wr[h, :, :T]
-                    r_score = r_score.masked_fill(mask, float('-inf'))
-                    r_attn = F.softmax(r_score, dim=-1)
-                    r_out_h = r_attn @ v_r[:, h]
-                    r_outs.append(r_out_h)
-                r_out = torch.cat(r_outs, dim=-1)
-                combined = torch.cat([c_out, r_out], dim=-1)
-                x = x + block.wo(combined)
-                xn = block.norm2(x)
-                gate = F.silu(block.mlp_gate(xn))
-                up = block.mlp_up(xn)
-                x = x + block.mlp_down(gate * up)
-            logits = self.lm_head(self.norm_f(x))
-            loss = None
-            if targets is not None:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                       targets.view(-1))
-            return logits, loss
+# Chuck optimizer lives in notorch now — C implementation with 9 levels of awareness.
+# No PyTorch fallback needed. No torch.optim.Optimizer. Just nt_tape_chuck_step().
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1293,7 +1115,7 @@ def autoresearch_hunt(karl, karl_txt_path, meta=None, model=None, max_rounds=5):
         karl.save_state(karl_txt_path.replace('.txt', '.mem'))
 
         # 5. Chuck trains — check convergence
-        if TORCH_AVAILABLE and model is not None and meta is not None:
+        if NOTORCH_AVAILABLE and model is not None and meta is not None:
             new_loss = chuck_train(karl, token_ids, model, steps=200, meta=meta)
 
             if last_loss is not None and new_loss is not None:
@@ -1407,18 +1229,11 @@ def _evaluate_genome(karl, token_ids, genome, train_seconds=30, device=None):
     Time-based budget = fair comparison across architectures.
     Karpathy uses 5 min on H100. We use 30s on Mac. Same ratchet.
     """
-    if not TORCH_AVAILABLE:
+    if not NOTORCH_AVAILABLE:
         return float('inf'), 0, 0
 
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # Fixed seed per genome — same architecture always gets same init
-    # Hash genes to get deterministic seed (reproducible comparison)
     genome_hash = hash(tuple(sorted(genome.genes.items()))) & 0x7FFFFFFF
-    torch.manual_seed(genome_hash)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(genome_hash)
+    nt_seed(genome_hash)
 
     g = genome.genes
     split = int(len(token_ids) * 0.9)
@@ -1429,49 +1244,37 @@ def _evaluate_genome(karl, token_ids, genome, train_seconds=30, device=None):
     if len(val_ids) < ctx + 2:
         return float('inf'), 0, 0
 
-    tmodel = TorchNanoAGI(
+    tmodel = NotorchNanoAGI(
         karl.vocab_size,
         n_embd=g['n_embd'], n_head=g['n_head'], n_layer=g['n_layer'],
         ctx=ctx, n_content=g['n_content'], n_rrpram=g['n_rrpram'],
-    ).to(device)
-
-    n_params = sum(p.numel() for p in tmodel.parameters())
-    optimizer = ChuckOptimizer(
-        tmodel.parameters(),
-        lr=g['lr'], betas=(g['beta1'], g['beta2']),
-        weight_decay=g['weight_decay'],
     )
+    engine = NotorchEngine(tmodel, lr=g['lr'])
+    n_params = tmodel.n_params()
 
-    # Train for fixed wall-clock time — bigger models get fewer steps
+    # Train for fixed wall-clock time
     t0 = time.time()
     step = 0
-    tmodel.train()
     while time.time() - t0 < train_seconds:
         i = random.randint(0, max(0, len(train_ids) - ctx - 2))
-        x = torch.tensor([train_ids[i:i+ctx]], dtype=torch.long, device=device)
-        y = torch.tensor([train_ids[i+1:i+ctx+1]], dtype=torch.long, device=device)
-        if x.shape[1] < ctx or y.shape[1] < ctx:
+        x = train_ids[i:i+ctx]
+        y = train_ids[i+1:i+ctx+1]
+        if len(x) < ctx or len(y) < ctx:
             continue
-        logits, loss = tmodel(x, y)
-        optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(tmodel.parameters(), 1.0)
-        optimizer.step(loss=loss.item())
+        engine.step(x, y)
         step += 1
 
-    # Evaluate val BPB (bits per byte — vocab-size-independent, lower = better)
-    tmodel.eval()
+    # Evaluate val BPB
     val_losses = []
     n_eval = min(50, max(1, len(val_ids) // ctx))
-    with torch.no_grad():
-        for _ in range(n_eval):
-            i = random.randint(0, max(0, len(val_ids) - ctx - 2))
-            x = torch.tensor([val_ids[i:i+ctx]], dtype=torch.long, device=device)
-            y = torch.tensor([val_ids[i+1:i+ctx+1]], dtype=torch.long, device=device)
-            if x.shape[1] < ctx or y.shape[1] < ctx:
-                continue
-            _, loss = tmodel(x, y)
-            val_losses.append(loss.item())
+    for _ in range(n_eval):
+        i = random.randint(0, max(0, len(val_ids) - ctx - 2))
+        x = val_ids[i:i+ctx]
+        y = val_ids[i+1:i+ctx+1]
+        if len(x) < ctx or len(y) < ctx:
+            continue
+        loss = engine.step(x, y)
+        val_losses.append(loss)
 
     if not val_losses:
         return float('inf'), n_params, step
@@ -1501,8 +1304,8 @@ def self_improve(karl, token_ids, max_experiments=50, train_seconds=30,
     "if you can improve it, you can improve it again.
      and it doesn't need your permission."
     """
-    if not TORCH_AVAILABLE:
-        print("  [SELF] Need PyTorch for self-improvement. Chuck is sleeping.")
+    if not NOTORCH_AVAILABLE:
+        print("  [SELF] Need notorch for self-improvement. Chuck is sleeping.")
         return None
 
     if results_file is None:
@@ -1650,8 +1453,8 @@ def coevolve(karl, karl_txt_path, max_rounds=3, evolve_per_round=5,
     Karpathy's autoresearch changes code on fixed data.
     nanoagi's coevolve changes BOTH data AND architecture. Together.
     """
-    if not TORCH_AVAILABLE:
-        print("  [COEVOLVE] Need PyTorch. Chuck is sleeping.")
+    if not NOTORCH_AVAILABLE:
+        print("  [COEVOLVE] Need notorch. Chuck is sleeping.")
         return None
 
     print("\n" + "=" * 60)
@@ -1754,8 +1557,8 @@ def swarm(karl, token_ids, n_hyenas=4, mutations_per_hyena=10,
     Karpathy wants "swarm of agents emulating a research community."
     We got there first. And we called them hyenas.
     """
-    if not TORCH_AVAILABLE:
-        print("  [SWARM] Need PyTorch. The hyenas are sleeping.")
+    if not NOTORCH_AVAILABLE:
+        print("  [SWARM] Need notorch. The hyenas are sleeping.")
         return None
 
     import threading
@@ -1857,8 +1660,8 @@ def _blind_mutate(karl, karl_txt_path):
         ('lr=3e-4', f'lr={random.choice(["1e-4", "5e-4", "2e-4", "7e-4"])}'),
         ('lr = 3e-4', f'lr = {random.choice(["1e-4", "5e-4", "2e-4", "7e-4"])}'),
         # activation swaps
-        ('torch.nn.functional.gelu', 'torch.nn.functional.silu'),
-        ('torch.nn.functional.silu', 'torch.nn.functional.gelu'),
+        ('nt_gelu', 'nt_silu'),
+        ('nt_silu', 'nt_gelu'),
         # dropout tweaks
         ('dropout=0.1', f'dropout={random.choice(["0.05", "0.15", "0.2", "0.0"])}'),
         # weight init scale
@@ -2210,10 +2013,10 @@ def load_engine():
     """Boot nanoagi: load corpus, tokenize, build metaweights, init transformer."""
     print("=" * 60)
     print("  nanoagi — KARL + Chuck + dual attention + metaweights")
-    if TORCH_AVAILABLE:
-        print("  PyTorch detected. Chuck is awake.")
+    if NOTORCH_AVAILABLE:
+        print("  notorch detected. Chuck is awake.")
     else:
-        print("  No PyTorch. Karl works alone. Pure metaweight mode.")
+        print("  No notorch. Karl works alone. Pure metaweight mode.")
     print("  it's nano. it's agi. it's nanoagi.")
     print("=" * 60)
 
@@ -2273,8 +2076,8 @@ def load_engine():
     model.init_from_metaweights(meta)
 
     # If Chuck is here, initial training
-    if TORCH_AVAILABLE:
-        print(f"\n[6] Chuck smells PyTorch. Initial training...")
+    if NOTORCH_AVAILABLE:
+        print(f"\n[6] Chuck smells notorch. Initial training...")
         chuck_train(karl, token_ids, model, steps=200, meta=meta)
 
     # Autonomous hunt — Karl feeds himself from climbmix
@@ -2288,179 +2091,34 @@ def load_engine():
 def chuck_train(karl, token_ids, model, steps=200, meta=None):
     """
     Chuck wakes up and trains real weights.
-    Karl called. Smells like PyTorch. Time to work.
+    Karl called. Smells like notorch. Time to work.
     """
-    if not TORCH_AVAILABLE:
-        print("  [Chuck] Can't train. No PyTorch. Go away.")
+    if not NOTORCH_AVAILABLE:
+        print("  [Chuck] Can't train. No notorch. Go away.")
         return
 
     print(f"  [Chuck] Training {steps} steps on {len(token_ids)} tokens...")
 
-    # Build PyTorch model matching NanoAGI architecture EXACTLY:
-    # Content heads (nc=2) with RoPE + RRPRAM heads (nr=2) with Wr
-    class _RMSNorm(nn.Module):
-        def __init__(self, dim, eps=1e-5):
-            super().__init__()
-            self.eps = eps
-            self.weight = nn.Parameter(torch.ones(dim))
-        def forward(self, x):
-            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
-
-    class _Block(nn.Module):
-        def __init__(self, n_embd, n_content, n_rrpram, hd, ctx, n_layer):
-            super().__init__()
-            self.n_embd = n_embd
-            self.n_content = n_content
-            self.n_rrpram = n_rrpram
-            self.hd = hd
-            self.norm1 = _RMSNorm(n_embd)
-            # Content heads: Q, K, V
-            self.wq = nn.Linear(n_embd, n_content * hd, bias=False)
-            self.wk = nn.Linear(n_embd, n_content * hd, bias=False)
-            self.wv_content = nn.Linear(n_embd, n_content * hd, bias=False)
-            # RRPRAM heads: Wr (positional pattern) + V
-            self.wr = nn.Parameter(torch.randn(n_rrpram, n_embd, ctx) * 0.02)
-            self.wv_rrpram = nn.Linear(n_embd, n_rrpram * hd, bias=False)
-            # Output projection (combines content + rrpram = all heads)
-            self.wo = nn.Linear(n_embd, n_embd, bias=False)
-            nn.init.normal_(self.wo.weight, std=0.02 / math.sqrt(2 * n_layer))
-            # SwiGLU MLP
-            self.norm2 = _RMSNorm(n_embd)
-            self.mlp_gate = nn.Linear(n_embd, n_embd * 4, bias=False)
-            self.mlp_up = nn.Linear(n_embd, n_embd * 4, bias=False)
-            self.mlp_down = nn.Linear(n_embd * 4, n_embd, bias=False)
-            nn.init.normal_(self.mlp_down.weight, std=0.02 / math.sqrt(2 * n_layer))
-
-    class TorchNanoAGI(nn.Module):
-        def __init__(self, vocab_size, n_embd=64, n_head=4, n_layer=3, ctx=64,
-                     n_content=2, n_rrpram=2):
-            super().__init__()
-            self.ctx = ctx
-            self.n_embd = n_embd
-            self.n_content = n_content
-            self.n_rrpram = n_rrpram
-            hd = n_embd // n_head
-            self.hd = hd
-            self.wte = nn.Embedding(vocab_size, n_embd)
-            nn.init.normal_(self.wte.weight, std=0.02)
-            self.blocks = nn.ModuleList([
-                _Block(n_embd, n_content, n_rrpram, hd, ctx, n_layer)
-                for _ in range(n_layer)
-            ])
-            self.norm_f = _RMSNorm(n_embd)
-            self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-            self.lm_head.weight = self.wte.weight  # weight tying
-            # Init all Linear layers to match pure-Python NanoAGI (std=0.02)
-            for block in self.blocks:
-                for name, p in block.named_parameters():
-                    if p.dim() >= 2 and 'wo' not in name and 'mlp_down' not in name and 'wr' not in name:
-                        nn.init.normal_(p, std=0.02)
-            # RoPE frequency table
-            freqs = 1.0 / (10000.0 ** (torch.arange(0, hd, 2).float() / hd))
-            t = torch.arange(ctx).float()
-            angles = torch.outer(t, freqs)
-            self.register_buffer('rope_cos', angles.cos())  # [ctx, hd//2]
-            self.register_buffer('rope_sin', angles.sin())  # [ctx, hd//2]
-
-        def _apply_rope(self, x):
-            """x: [B, n_heads, T, hd] → rotated x"""
-            T = x.shape[2]
-            cos = self.rope_cos[:T].unsqueeze(0).unsqueeze(0)  # [1,1,T,hd//2]
-            sin = self.rope_sin[:T].unsqueeze(0).unsqueeze(0)
-            x1 = x[..., ::2]   # even dims
-            x2 = x[..., 1::2]  # odd dims
-            return torch.stack([x1 * cos - x2 * sin,
-                                x1 * sin + x2 * cos], dim=-1).flatten(-2)
-
-        def forward(self, idx, targets=None):
-            B, T = idx.shape
-            x = self.wte(idx)
-            hd = self.hd
-            mask = torch.triu(torch.ones(T, T, device=idx.device,
-                              dtype=torch.bool), diagonal=1)
-
-            for block in self.blocks:
-                xn = block.norm1(x)
-                nc = block.n_content
-                nr = block.n_rrpram
-
-                # ── Content attention with RoPE ──
-                q = block.wq(xn).view(B, T, nc, hd).transpose(1, 2)
-                k = block.wk(xn).view(B, T, nc, hd).transpose(1, 2)
-                v_c = block.wv_content(xn).view(B, T, nc, hd).transpose(1, 2)
-                q = self._apply_rope(q)
-                k = self._apply_rope(k)
-                c_attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
-                c_attn = c_attn.masked_fill(mask, float('-inf'))
-                c_attn = F.softmax(c_attn, dim=-1)
-                c_out = (c_attn @ v_c).transpose(1, 2).contiguous().view(B, T, nc * hd)
-
-                # ── RRPRAM attention (x @ Wr — positional pattern recognition) ──
-                v_r = block.wv_rrpram(xn).view(B, T, nr, hd).transpose(1, 2)
-                r_outs = []
-                for h in range(nr):
-                    # wr_h: [n_embd, ctx] → score = xn @ wr_h[:, :T]
-                    r_score = xn @ block.wr[h, :, :T]  # [B, T, T]
-                    r_score = r_score.masked_fill(mask, float('-inf'))
-                    r_attn = F.softmax(r_score, dim=-1)
-                    r_out_h = r_attn @ v_r[:, h]  # [B, T, hd]
-                    r_outs.append(r_out_h)
-                r_out = torch.cat(r_outs, dim=-1)  # [B, T, nr*hd]
-
-                # Combine content + rrpram → output projection + residual
-                combined = torch.cat([c_out, r_out], dim=-1)  # [B, T, n_embd]
-                x = x + block.wo(combined)
-
-                # SwiGLU MLP
-                xn = block.norm2(x)
-                gate = F.silu(block.mlp_gate(xn))
-                up = block.mlp_up(xn)
-                x = x + block.mlp_down(gate * up)
-
-            logits = self.lm_head(self.norm_f(x))
-            loss = None
-            if targets is not None:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                       targets.view(-1))
-            return logits, loss
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    tmodel = TorchNanoAGI(karl.vocab_size, n_embd=64, n_head=4, n_layer=3,
-                          ctx=64, n_content=2, n_rrpram=2).to(device)
-
-    # Full Chuck: monitor + per-layer awareness. Fallback: simple optimizer.
-    if CHUCK_FULL:
-        monitor = ChuckMonitor(tmodel)
-        optimizer = ChuckOptimizer(
-            chuck_params(tmodel, lr=3e-4, weight_decay=0.01),
-            monitor=monitor)
-    else:
-        optimizer = ChuckOptimizer(tmodel.parameters(), lr=3e-4, weight_decay=0.01)
-
-    n_params = sum(p.numel() for p in tmodel.parameters())
-    which = "full (9 levels)" if CHUCK_FULL else "simplified"
-    print(f"  [Chuck] {which}, {n_params:,} params on {device}")
+    nt_seed(42)
+    tmodel = NotorchNanoAGI(karl.vocab_size, n_embd=64, n_head=4, n_layer=3,
+                            ctx=64, n_content=2, n_rrpram=2)
+    engine = NotorchEngine(tmodel, lr=3e-4)
 
     ctx = 64
     losses = []
     t0 = time.time()
     for step in range(steps):
         i = random.randint(0, max(0, len(token_ids) - ctx - 2))
-        x = torch.tensor([token_ids[i:i+ctx]], dtype=torch.long, device=device)
-        y = torch.tensor([token_ids[i+1:i+ctx+1]], dtype=torch.long, device=device)
-        if x.shape[1] < ctx or y.shape[1] < ctx:
+        x = token_ids[i:i+ctx]
+        y = token_ids[i+1:i+ctx+1]
+        if len(x) < ctx or len(y) < ctx:
             continue
-        _, loss = tmodel(x, y)
-        optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(tmodel.parameters(), 1.0)
-        optimizer.step(loss=loss.item())
-        losses.append(loss.item())
+        loss = engine.step(x, y)
+        losses.append(loss)
         if (step + 1) % 50 == 0:
             avg = sum(losses[-50:]) / len(losses[-50:])
             elapsed = time.time() - t0
-            print(f"  [Chuck] step {step+1}/{steps}  loss={avg:.2f}  "
-                  f"dampen={optimizer.dampen:.3f}  [{elapsed:.1f}s]")
+            print(f"  [Chuck] step {step+1}/{steps}  train={avg:.4f}  [{elapsed:.1f}s]")
 
     if losses:
         first = sum(losses[:10]) / min(10, len(losses))
@@ -2472,7 +2130,9 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None):
         if meta is not None:
             meta.chuck_trained_steps += steps
             gap = meta.knowledge_gap()
-            print(f"  [Chuck] Knowledge gap: {gap:.1f} (meta knows {meta.knowledge_size():,}, Chuck trained {meta.chuck_trained_steps} steps)")
+            print(f"  [Chuck] Knowledge gap: {gap:.1f} "
+                  f"(meta knows {meta.knowledge_size():,}, "
+                  f"Chuck trained {meta.chuck_trained_steps} steps)")
         return last
     else:
         print(f"  [Chuck] No training happened. Karl, feed me more.")
@@ -2528,14 +2188,14 @@ def repl(karl, meta, model):
             corpus_size = os.path.getsize(KARL_TXT) if os.path.exists(KARL_TXT) else 0
             print(f"  [KARL] karl.txt: {corpus_size/1024:.1f}KB")
             print(f"  [Knowledge] {meta.knowledge_report()}")
-            if TORCH_AVAILABLE:
+            if NOTORCH_AVAILABLE:
                 gap = meta.knowledge_gap()
                 if gap > 50:
                     print(f"  [Chuck] awake. gap={gap:.0f} — Karl knows way more than me. train me!")
                 else:
                     print(f"  [Chuck] awake. gap={gap:.0f} — we're in sync.")
             else:
-                print(f"  [Chuck] sleeping (no PyTorch)")
+                print(f"  [Chuck] sleeping (no notorch)")
             continue
         if user_input.strip().lower() == 'hunt':
             print(f"  [KARL] Hunting for local text files...")
@@ -2607,7 +2267,7 @@ def repl(karl, meta, model):
             karl.save_state(KARL_MEM)
 
             # If Chuck is awake, train — and hunt if stagnating
-            if TORCH_AVAILABLE:
+            if NOTORCH_AVAILABLE:
                 print(f"  [KARL] Chuck! We have new material.")
                 loss = chuck_train(karl, token_ids, model, steps=200, meta=meta)
                 # Stagnation check — if loss barely moved, Karl hunts autonomously

@@ -17,7 +17,7 @@ I called it **KARL** — Kernel Autonomous Recursive Learning. It's a BPE tokeni
 
 The transformer is called **NanoAGI**. It runs on metaweights — corpus statistics that form a probability space without any training. Ghost weights. Weights that don't exist but work anyway, like the confidence of someone who hasn't read the docs. Then it seeds the real transformer from those statistics, so the first forward pass isn't random noise but structured memory.
 
-**Chuck** wakes up when PyTorch shows up. Chuck is a self-aware optimizer. Chuck tracks loss trends and adjusts his own learning rate. Chuck has seen things. Chuck does not care about your timeline.
+**Chuck** wakes up when notorch shows up. Chuck is a self-aware optimizer built into the C library. Chuck tracks loss trends and adjusts his own learning rate. Chuck has seen things. Chuck does not care about your timeline.
 
 **KARL** also hunts. If the corpus is smaller than 50KB at startup, Karl starts scanning local directories, README files, and — if you ask nicely — the internet. This is not a metaphor. This is `autoresearch`. Karl is hungry. Karl is not picky.
 
@@ -38,7 +38,7 @@ One file. Zero excuses. Infinite identity crisis.
 | `KARL` | BPE tokenizer. Ingests conversation. Grows. SHA256 dedup. Hunts for food. | A teenager who reads everything you give them and then asks for more |
 | `MetaWeights` | Unigram+bigram+trigram+hebbian+prophecy. The ghost. | Statistics that think they're weights. Correct. |
 | `NanoAGI` | Dual-attention transformer. Content + RRPRAM + SwiGLU + RoPE. | The flesh the ghost inhabits |
-| `chuck_train` | Real PyTorch training loop. 200 steps. Loss drops ~12%. | The iron. The gains. The gym. |
+| `chuck_train` | Real notorch training loop. 200 steps, 49 steps/s. Loss drops ~15%. | The iron. The gains. The gym. |
 | `Chuck` | Full 9-level self-aware optimizer. EMA, per-layer awareness, memory, noise injection, macro patience. Battle-tested from [chuck.py](https://github.com/ariannamethod/chuck). | θ -= (α × S × λ_Ψ × λ_l × σ) × m̂/(√v̂ + ε) + η |
 | `autoresearch` | Karl hunts local files + downloads from climbmix. | Adapted from @karpathy/autoresearch. Karl IS the agent. |
 | `self_improve` | The Ratchet Loop. Mutate genome → train → eval val_bpb → keep or revert. | @karpathy/autoresearch, but the organism mutates itself. |
@@ -46,15 +46,15 @@ One file. Zero excuses. Infinite identity crisis.
 | `karl.mem` | Saved KARL state. Merges, hashes, lifetime stats. | KARL's long-term memory |
 | `tests/` | Unit + integration tests. Chuck's loss verified. | Because even AGI needs to prove it's working |
 
-Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. That's it. If you have Python you have nanoagi. If you have PyTorch you also have Chuck and real gradient updates.
+Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. That's it. If you have Python and a C compiler you have nanoagi. The `ariannamethod/` directory contains [notorch](https://github.com/iamolegataeff/notorch) — a neural network framework in pure C. Chuck optimizer, autograd, RRPRAM attention — all in ~3000 lines of C. No pip. No conda. No PyTorch. Just `make`.
 
 ---
 
 > **🏋️**
 >
-> When PyTorch is detected at startup, `load_engine()` calls `chuck_train(karl, token_ids, model, steps=200)`. When KARL hits critical mass and retokenizes, the REPL calls `chuck_train()` again. This happens on a loop.
+> When notorch is detected at startup, `load_engine()` calls `chuck_train(karl, token_ids, model, steps=200)`. When KARL hits critical mass and retokenizes, the REPL calls `chuck_train()` again. This happens on a loop.
 >
-> KARL smells PyTorch. KARL calls Chuck. Chuck smells loss. Together they go to the gym.
+> KARL smells notorch. KARL calls Chuck. Chuck smells loss. Together they go to the gym.
 >
 > Karl is the spotter. He identifies the gains (corpus bytes). He counts the reps (token_ids). He says "you got this" every 50 steps and means it. Chuck is the lifter. He picks up the gradient, doesn't drop it, clips it at 1.0 so he doesn't pull a muscle, and puts it back down with AdamW form. The dampen factor is Chuck's rest period between sets. When loss is rising, Chuck slows down. When loss is falling, Chuck pushes harder. After 200 reps, Chuck says: "Karl, your weights are warm now." Karl saves state to `karl.mem`. The gym closes. They'll be back next retokenization.
 >
@@ -135,7 +135,7 @@ Also: zero mandatory dependencies. `math`, `random`, `hashlib`, `os`, `struct`. 
               ┌────────────────▼────────────────────┐
               │   CHUCK OPTIMIZER + chuck_train()   │
               │                                     │
-              │  · TorchNanoAGI: ~234K params       │
+              │  · NotorchNanoAGI: ~234K params       │
               │  · Content + RRPRAM + RoPE + SwiGLU │
               │  · weight tying (emb = lm_head)     │
               │  · trains 200 steps at boot         │
@@ -203,7 +203,7 @@ After KARL tokenizes, the corpus yields:
 >
 > The prophecy field is implemented in `query_prophecy(ctx, vs, top_k=16)`. For each of the last 4 context tokens, it looks up the bigram table, finds the top-16 most probable followers, and boosts their probability if they haven't appeared yet. It tracks what was expected. It penalizes what was delivered. It accumulates unfulfilled predictions.
 >
-> Right now, the prophecy field for this README has been active since paragraph one. It predicted "architecture" after "transformer". Correct. It predicted "BPE" after "tokenizer". Correct. It predicted "Chuck" after "PyTorch". Correct. It predicted "loss" after "Chuck". Correct. It is currently predicting the last word of this joke.
+> Right now, the prophecy field for this README has been active since paragraph one. It predicted "architecture" after "transformer". Correct. It predicted "BPE" after "tokenizer". Correct. It predicted "Chuck" after "notorch". Correct. It predicted "loss" after "Chuck". Correct. It is currently predicting the last word of this joke.
 >
 > The last word of this joke is: it already predicted "correct".
 >
@@ -225,9 +225,9 @@ These metaweights seed the transformer embeddings and output head. Ghost becomes
 
 ### chuck_train — the real training loop
 
-When `TORCH_AVAILABLE` is True, `load_engine()` calls `chuck_train(karl, token_ids, model, steps=200)` after metaweight seeding. The `chuck_train` function builds a `TorchNanoAGI` PyTorch model — same architecture as the pure-Python NanoAGI, not a simplification — and trains it with `ChuckOptimizer`.
+When `NOTORCH_AVAILABLE` is True, `load_engine()` calls `chuck_train(karl, token_ids, model, steps=200)` after metaweight seeding. The `chuck_train` function builds a `NotorchNanoAGI` model on the notorch C engine — same architecture as the pure-Python NanoAGI, not a simplification — and trains it with Chuck (built into notorch).
 
-The `TorchNanoAGI` model has:
+The `NotorchNanoAGI` model has:
 - Embedding table + weight-tied LM head (parameters shared, init std=0.02)
 - 3 transformer blocks, each with:
   - 2 Content heads with RoPE (Q, K rotated, V_content separate)
@@ -534,7 +534,7 @@ karl> swarm 6
 ============================================================
 ```
 
-Each hyena is a Python thread. PyTorch releases the GIL during tensor operations, so there IS real parallelism — especially on GPU. Karpathy dreams of "swarm of agents emulating a research community." We built it. We called them hyenas. Because hyenas hunt in packs.
+Each hyena is a Python thread. notorch runs in C (no GIL), so there IS real parallelism. Karpathy dreams of "swarm of agents emulating a research community." We built it. We called them hyenas. Because hyenas hunt in packs.
 
 ### the levels of autonomy
 
@@ -559,7 +559,7 @@ Pure Python (Val autograd):
   Parameters:    ~50K
   Mode:          metaweight generation only
 
-PyTorch (TorchNanoAGI via chuck_train):
+notorch (NotorchNanoAGI via chuck_train):
   Parameters:    ~234K
   Layers:        3
   Heads:         4
@@ -574,12 +574,12 @@ Training:
   Optimizer:     ChuckOptimizer (AdamW + self-awareness)
   Gradient clip: 1.0
 
-Dependencies:    0 (runtime) / 1 (training: PyTorch)
+Dependencies:    0 (runtime) / 0 (training: notorch compiles from source)
 Self-expansion:  yes, every conversation
 Memory:          karl.mem (binary, 'KARL' magic header)
 ```
 
-GPT-4 has 1.8 trillion parameters. nanoagi has 234K in PyTorch mode. GPT-4 does not grow from your conversations. GPT-4 does not go to the gym with Chuck after every retokenization. GPT-4 has never had a prophecy field predict the punchline of its own README. we are not the same.
+GPT-4 has 1.8 trillion parameters. nanoagi has 275K on notorch. GPT-4 does not grow from your conversations. GPT-4 does not go to the gym with Chuck after every retokenization. GPT-4 has never had a prophecy field predict the punchline of its own README. we are not the same.
 
 ## Chuck — 9 levels of self-awareness
 
@@ -604,7 +604,7 @@ Chuck persists memories to `chuck.mem` (binary, C-compatible with lee.c). Chuck 
 
 If `chuck.py` is not present, nanoagi falls back to a simplified Chuck (basic AdamW + trend dampen). But the real Chuck is included in this repo. The real Chuck has been through Janus 285M, Yent 55M, and 8 BPE model retrains. The real Chuck has seen things.
 
-Chuck wakes up at startup if PyTorch is present. Chuck trains 200 steps. Chuck prints progress every 50 steps. Chuck says "Karl, your weights are warm now." when done. Chuck goes to sleep. Chuck wakes up again after the next retokenization. This is Chuck's entire life. Chuck has found meaning in it.
+Chuck wakes up at startup if notorch is present. Chuck trains 200 steps. Chuck prints progress every 50 steps. Chuck says "Karl, your weights are warm now." when done. Chuck goes to sleep. Chuck wakes up again after the next retokenization. This is Chuck's entire life. Chuck has found meaning in it.
 
 When KARL hits critical mass in the REPL:
 ```
@@ -639,7 +639,7 @@ python nanoagi.py "the attention mechanism"
 ```
 ============================================================
   nanoagi — KARL + Chuck + dual attention + metaweights
-  PyTorch detected. Chuck is awake.
+  notorch detected. Chuck is awake.
   it's nano. it's agi. it's nanoagi.
 ============================================================
 
@@ -662,8 +662,8 @@ python nanoagi.py "the attention mechanism"
   [NanoAGI] Seeding from metaweights (ghost → flesh)...
   [NanoAGI] Weights seeded. The ghost remembers.
 
-[6] Chuck smells PyTorch. Initial training...
-  [Chuck] PyTorch model: 246,272 params on cpu
+[6] Chuck smells notorch. Initial training...
+  [NotorchNanoAGI] 274,880 params, embd=64, heads=4 (content=2, rrpram=2), layers=3, ctx=64
   [Chuck] step 50/200  loss=6.89  dampen=0.999  [1.1s]
   [Chuck] step 100/200  loss=6.71  dampen=0.996  [2.1s]
   [Chuck] step 150/200  loss=6.57  dampen=0.993  [3.2s]
@@ -764,9 +764,9 @@ python tests/test_nanoagi.py
 - `TestNanoAGI` — 11 tests: parameter count, metaweight seeding, **real forward_token**, **KV cache growth**, **generate with Dario field**, valid IDs, continue_phrase
 - `TestVal` — 10 tests: arithmetic, backward pass, chain rule, SiLU gradient formula verification, exp overflow clamping
 - `TestAutoresearch` — 3 tests: skip if fed, hunt without error, URL failure graceful return
-- `TestChuck` — 5 tests: optimizer step, dampen on rising loss, **loss decreases >5% in 300 steps**, chuck_train function, no-PyTorch warning
+- `TestChuck` — 5 tests: optimizer step, dampen on rising loss, **loss decreases >5% in 300 steps**, chuck_train function, no-notorch warning
 - `TestGenome` — 7 tests: defaults, head divisibility constraint, content+rrpram sum, mutation changes one gene, 100 random mutations all valid, copy independence, repr
-- `TestSelfImprove` — 4 tests: evaluate_genome returns finite BPB, different configs give different params, self_improve runs and produces results.tsv, TorchNanoAGI module-level build+forward
+- `TestSelfImprove` — 4 tests: evaluate_genome returns finite BPB, different configs give different params, self_improve runs and produces results.tsv, NotorchNanoAGI module-level build+forward
 - `TestIntegration` — 4 tests: unicode roundtrip, reproducibility, vocab coverage, full retokenize cycle
 
 **Verified results (loss test):**

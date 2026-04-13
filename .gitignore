@@ -3,3 +3,6 @@ chuck.mem
 results.tsv
 __pycache__/
 *.pyc
+ariannamethod/libnotorch.dylib
+ariannamethod/libnotorch.so
+ariannamethod/*.o
