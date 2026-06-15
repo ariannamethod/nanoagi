@@ -350,9 +350,15 @@ class NotorchEngine:
     """
     Runs forward-backward-update for NotorchNanoAGI via C tape.
     """
-    def __init__(self, model, lr=3e-4):
+    def __init__(self, model, lr=3e-4, weight_decay=0.0, beta1=0.9, beta2=0.999):
         self.model = model
         self.lr = lr
+        self.weight_decay = weight_decay
+        # beta1/beta2 are stored but NOT yet honored: Chuck (C) takes only (lr, loss) and
+        # owns its momentum internally. Wiring the beta genes through needs an extended
+        # nt_tape_chuck_step signature in the C core (TODO — Oleg's call on touching Chuck).
+        self.beta1 = beta1
+        self.beta2 = beta2
         # Deduplicate tied weights (e.g. wte == lm_head)
         seen = set()
         self.params = []
@@ -361,8 +367,12 @@ class NotorchEngine:
                 seen.add(p._ptr)
                 self.params.append(p)
 
-    def step(self, token_ids, target_ids):
-        """One training step. Returns loss float."""
+    def step(self, token_ids, target_ids, update=True):
+        """One training step. Returns loss float.
+
+        update=False makes it forward-only (loss measurement without a weight
+        update) — used to score validation without training on the val set.
+        """
         m = self.model
         T = len(token_ids)
         ctx = m.ctx
@@ -453,10 +463,19 @@ class NotorchEngine:
         loss_val = ctypes.cast(tape_ptr, ctypes.POINTER(_NtTapeEntry))[loss_idx].output
         loss_val = ctypes.cast(loss_val, ctypes.POINTER(_NtTensor)).contents.data[0]
 
-        # Backward + optimizer step
-        _lib.nt_tape_backward(loss_idx)
-        _lib.nt_tape_clip_grads(ctypes.c_float(1.0))
-        _lib.nt_tape_chuck_step(ctypes.c_float(self.lr), ctypes.c_float(loss_val))
+        # Backward + optimizer step (skipped for forward-only eval — no train-on-val leak)
+        if update:
+            _lib.nt_tape_backward(loss_idx)
+            _lib.nt_tape_clip_grads(ctypes.c_float(1.0))
+            _lib.nt_tape_chuck_step(ctypes.c_float(self.lr), ctypes.c_float(loss_val))
+            # Decoupled weight decay (AdamW-style): θ *= (1 - lr*wd). Honors the evolved
+            # weight_decay gene, which used to be dropped (only lr reached the engine).
+            if self.weight_decay > 0.0:
+                factor = 1.0 - self.lr * self.weight_decay
+                for p in self.params:
+                    ts = _get_ts(p._ptr)
+                    for j in range(ts.len):
+                        ts.data[j] *= factor
         _lib.nt_tape_clear()
 
         return loss_val

@@ -826,15 +826,15 @@ class NanoAGI:
                                       + 12.0 * bigram[i]
                                       + 8.0 * trigram[i])
 
-                # Trauma modulation
-                trauma_mod = 1.0 / (1.0 + self.trauma)
-                raw_logits = [l * trauma_mod for l in raw_logits]
+                # Trauma modulates the field through temperature (Dario: T lives inside /τ),
+                # applied at the scaling step below — negative-safe, unlike a raw-logit multiply
+                # (which boosts negative logits toward zero).
 
             # Repetition penalty (Leo-style)
             recent = context[-12:] if len(context) >= 12 else context
             for t in recent:
                 if t < self.vocab_size:
-                    raw_logits[t] *= 0.5
+                    raw_logits[t] -= 4.0   # subtractive penalty — negative-safe (a *0.5 boosts negative logits toward 0)
 
             # Top-k + temperature + softmax
             top_k = 15
@@ -844,7 +844,8 @@ class NanoAGI:
                 if raw_logits[i] < threshold:
                     raw_logits[i] = -1e10
 
-            scaled = [l / temperature for l in raw_logits]
+            eff_temp = temperature * (1.0 + self.trauma)   # trauma heats the field (Dario T/τ), negative-safe
+            scaled = [l / eff_temp for l in raw_logits]
             probs = softmax_float(scaled)
 
             # Sample
@@ -859,6 +860,11 @@ class NanoAGI:
 
             generated.append(chosen)
             context.append(chosen)
+
+            # Trauma accumulates from surprising (below-uniform-probability) tokens.
+            # README: "self.trauma += 0.1 every time a surprising token appears."
+            if probs[chosen] < 1.0 / self.vocab_size:
+                self.trauma += 0.1
 
         return generated
 
@@ -953,9 +959,7 @@ def _has_internet():
     try:
         from urllib.request import urlopen, Request
         import ssl
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx = ssl.create_default_context()   # verify on + check_hostname (was CERT_NONE — corpus-poisoning vector for a self-feeding organism)
         req = Request("https://datasets-server.huggingface.co/",
                       method='HEAD')
         req.add_header('User-Agent', 'nanoagi/1.0 (KARL)')
@@ -977,9 +981,7 @@ def _download_climbmix_batch(num_docs=50, offset=None):
     except ImportError:
         return []
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx = ssl.create_default_context()   # verify on + check_hostname (was CERT_NONE — corpus-poisoning vector for a self-feeding organism)
 
     if offset is None:
         offset = random.randint(0, 500_000)
@@ -1249,7 +1251,8 @@ def _evaluate_genome(karl, token_ids, genome, train_seconds=30, device=None):
         n_embd=g['n_embd'], n_head=g['n_head'], n_layer=g['n_layer'],
         ctx=ctx, n_content=g['n_content'], n_rrpram=g['n_rrpram'],
     )
-    engine = NotorchEngine(tmodel, lr=g['lr'])
+    engine = NotorchEngine(tmodel, lr=g['lr'], weight_decay=g['weight_decay'],
+                           beta1=g['beta1'], beta2=g['beta2'])
     n_params = tmodel.n_params()
 
     # Train for fixed wall-clock time
@@ -1273,7 +1276,7 @@ def _evaluate_genome(karl, token_ids, genome, train_seconds=30, device=None):
         y = val_ids[i+1:i+ctx+1]
         if len(x) < ctx or len(y) < ctx:
             continue
-        loss = engine.step(x, y)
+        loss = engine.step(x, y, update=False)  # forward-only: measure val without training on it
         val_losses.append(loss)
 
     if not val_losses:
@@ -1823,9 +1826,7 @@ def _llm_chat(llm_env, system_prompt, user_prompt, max_tokens=800, temperature=0
     import json as _json
     import ssl
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx = ssl.create_default_context()   # verify on + check_hostname (was CERT_NONE — corpus-poisoning vector for a self-feeding organism)
 
     if llm_env['type'] in ('ollama', 'llamacpp', 'hf'):
         payload = _json.dumps({
