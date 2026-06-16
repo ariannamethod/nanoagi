@@ -23,12 +23,23 @@ import math
 import time
 import struct
 import random
+import asyncio
 import tempfile
 import unittest
 
 # Add repo root to path so we can import nanoagi
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import nanoagi
+
+# Real torch availability. nanoagi.TORCH_AVAILABLE is a compat ALIAS for
+# NOTORCH_AVAILABLE (nanoagi was depythonized to notorch — there is no torch module
+# and no torch ChuckOptimizer anymore), so the legacy PyTorch tests must gate on the
+# actual torch module, or they fail with ModuleNotFoundError on the alias being True.
+try:
+    import torch as _torch  # noqa: F401
+    _REAL_TORCH = True
+except ImportError:
+    _REAL_TORCH = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # helpers
@@ -533,7 +544,7 @@ class TestAutoresearch(unittest.TestCase):
 # VI. Chuck training loop tests (requires PyTorch)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@unittest.skipUnless(nanoagi.TORCH_AVAILABLE, "PyTorch not available")
+@unittest.skipUnless(_REAL_TORCH,"PyTorch not available")
 class TestChuck(unittest.TestCase):
 
     def setUp(self):
@@ -772,7 +783,7 @@ class TestIntegration(unittest.TestCase):
 
     def test_torch_nanoagi_model_exists_when_available(self):
         """chuck_train should build a TorchNanoAGI model without error."""
-        if not nanoagi.TORCH_AVAILABLE:
+        if not _REAL_TORCH:
             self.skipTest("PyTorch not available")
         import io
         from contextlib import redirect_stdout
@@ -859,7 +870,7 @@ class TestSelfImprove(unittest.TestCase):
         self.karl = make_karl(merges=64)
         self.meta, self.ids = make_meta(self.karl)
 
-    @unittest.skipUnless(nanoagi.TORCH_AVAILABLE, "PyTorch required")
+    @unittest.skipUnless(_REAL_TORCH,"PyTorch required")
     def test_evaluate_genome_returns_finite_bpb(self):
         """_evaluate_genome must return a finite BPB with enough data."""
         g = nanoagi.Genome()
@@ -871,7 +882,7 @@ class TestSelfImprove(unittest.TestCase):
         self.assertGreater(n_params, 0)
         self.assertGreater(steps, 0)
 
-    @unittest.skipUnless(nanoagi.TORCH_AVAILABLE, "PyTorch required")
+    @unittest.skipUnless(_REAL_TORCH,"PyTorch required")
     def test_evaluate_genome_different_configs(self):
         """Different genomes should produce different results."""
         g1 = nanoagi.Genome()
@@ -887,7 +898,7 @@ class TestSelfImprove(unittest.TestCase):
             self.karl, self.ids, g2, train_seconds=2)
         self.assertNotEqual(p1, p2)
 
-    @unittest.skipUnless(nanoagi.TORCH_AVAILABLE, "PyTorch required")
+    @unittest.skipUnless(_REAL_TORCH,"PyTorch required")
     def test_self_improve_runs_and_logs(self):
         """self_improve should run 3 experiments and produce results.tsv."""
         import io
@@ -920,7 +931,7 @@ class TestSelfImprove(unittest.TestCase):
         finally:
             os.unlink(results_path)
 
-    @unittest.skipUnless(nanoagi.TORCH_AVAILABLE, "PyTorch required")
+    @unittest.skipUnless(_REAL_TORCH,"PyTorch required")
     def test_torch_nanoagi_module_level(self):
         """TorchNanoAGI at module level should build and forward."""
         import torch
@@ -937,10 +948,137 @@ class TestSelfImprove(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# VIII. Mythos-revival tests — the fixes that raised code to the README
+# ─────────────────────────────────────────────────────────────────────────────
+
+@unittest.skipUnless(getattr(nanoagi, 'NOTORCH_AVAILABLE', False), "notorch not available")
+class TestRevival(unittest.TestCase):
+    """forward-only eval, weight decay, beta genes, persistence, ssl — all gated."""
+
+    def _model(self):
+        from ariannamethod.notorch_nn import NotorchNanoAGI
+        return NotorchNanoAGI(50, n_embd=32, n_head=2, n_layer=1, ctx=16, n_content=1, n_rrpram=1)
+
+    def _norm(self, e):
+        from ariannamethod.notorch_nn import _get_ts
+        s = 0.0
+        for p in e.params:
+            ts = _get_ts(p._ptr)
+            for j in range(ts.len):
+                s += ts.data[j] * ts.data[j]
+        return math.sqrt(s)
+
+    def _vec(self, e):
+        from ariannamethod.notorch_nn import _get_ts
+        out = []
+        for p in e.params:
+            ts = _get_ts(p._ptr)
+            out += [ts.data[j] for j in range(ts.len)]
+        return out
+
+    def test_forward_only_no_leak(self):
+        """#3: update=False is forward-only — val isn't trained on."""
+        from ariannamethod.notorch_nn import NotorchEngine, _lib
+        X, Y = list(range(16)), list(range(1, 17))
+        _lib.nt_seed(42)
+        e = NotorchEngine(self._model(), lr=1e-2)
+        l1 = e.step(X, Y, update=False)
+        l2 = e.step(X, Y, update=False)
+        self.assertLess(abs(l1 - l2), 1e-9)
+        e.step(X, Y, update=True)
+        l3 = e.step(X, Y, update=False)
+        self.assertGreater(abs(l3 - l1), 1e-9)
+
+    def test_weight_decay_shrinks(self):
+        """#2-wd: decoupled weight decay reduces the weight norm."""
+        from ariannamethod.notorch_nn import NotorchEngine, _lib
+        X, Y = list(range(16)), list(range(1, 17))
+        _lib.nt_seed(7); e0 = NotorchEngine(self._model(), lr=1e-4, weight_decay=0.0)
+        _lib.nt_seed(7); e1 = NotorchEngine(self._model(), lr=1e-4, weight_decay=5.0)
+        for _ in range(30):
+            e0.step(X, Y); e1.step(X, Y)
+        self.assertLess(self._norm(e1), self._norm(e0))
+
+    def test_beta_affects_training(self):
+        """#2-beta: different beta genes produce different weights (Chuck momentum)."""
+        from ariannamethod.notorch_nn import NotorchEngine, _lib
+        X, Y = list(range(16)), list(range(1, 17))
+        _lib.nt_seed(42); e0 = NotorchEngine(self._model(), lr=1e-2, beta1=0.5, beta2=0.9)
+        _lib.nt_seed(42); e1 = NotorchEngine(self._model(), lr=1e-2, beta1=0.99, beta2=0.999)
+        for _ in range(15):
+            e0.step(X, Y); e1.step(X, Y)
+        d = math.sqrt(sum((a - b) ** 2 for a, b in zip(self._vec(e0), self._vec(e1))))
+        self.assertGreater(d, 1e-4)
+
+    def test_persistence_round_trip(self):
+        """#5: save/load restores trained weights (cumulative chuck training)."""
+        from ariannamethod.notorch_nn import NotorchEngine, _lib
+        X, Y = list(range(16)), list(range(1, 17))
+        _lib.nt_seed(42); e = NotorchEngine(self._model(), lr=1e-2)
+        for _ in range(15):
+            e.step(X, Y)
+        nb = self._norm(e)
+        path = tempfile.mktemp(suffix='.nt')
+        e.save(path)
+        _lib.nt_seed(99); e2 = NotorchEngine(self._model(), lr=1e-2)
+        nf = self._norm(e2)
+        e2.load(path)
+        nl = self._norm(e2)
+        os.unlink(path)
+        self.assertLess(abs(nl - nb), 1e-2)
+        self.assertGreater(abs(nf - nb), 1e-2)
+
+    def test_ssl_verified(self):
+        """ssl: default context verifies certs (no CERT_NONE poisoning vector)."""
+        import ssl
+        ctx = ssl.create_default_context()
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+
+
+class TestAsyncAlive(unittest.TestCase):
+    """async B: talk + train + hunt run concurrently with clean shutdown."""
+
+    def test_alive_runs_tasks_concurrently(self):
+        import builtins
+        saved = (nanoagi.continue_phrase, nanoagi.chuck_train, nanoagi.autoresearch_hunt,
+                 nanoagi.NOTORCH_AVAILABLE, nanoagi.KARL_TXT, builtins.input)
+        try:
+            calls = {'gen': 0, 'train': 0, 'hunt': 0}
+            nanoagi.KARL_TXT = tempfile.mktemp(suffix='.txt')
+            open(nanoagi.KARL_TXT, 'wb').write(b'food ' * 100)
+            nanoagi.continue_phrase = lambda *a, **k: (calls.update(gen=calls['gen'] + 1) or 'r')
+            nanoagi.chuck_train = lambda *a, **k: (calls.update(train=calls['train'] + 1) or 1.0)
+            nanoagi.autoresearch_hunt = lambda *a, **k: calls.update(hunt=calls['hunt'] + 1)
+            nanoagi.NOTORCH_AVAILABLE = True
+            inp = iter(['hi', 'quit'])
+            def fake_input(*a):
+                time.sleep(0.3)
+                return next(inp)
+            builtins.input = fake_input
+            class FK:
+                vocab_size = 50
+                def ingest(self, t): pass
+                def encode(self, b): return list(range(20))
+            class FM:
+                def knowledge_gap(self): return 100
+            asyncio.run(nanoagi.alive(FK(), FM(), object(),
+                                      train_every=0.1, hunt_every=0.15, train_steps=5))
+            self.assertGreaterEqual(calls['gen'], 1)
+            self.assertGreaterEqual(calls['train'], 1)
+        finally:
+            if os.path.exists(nanoagi.KARL_TXT):
+                os.unlink(nanoagi.KARL_TXT)
+            (nanoagi.continue_phrase, nanoagi.chuck_train, nanoagi.autoresearch_hunt,
+             nanoagi.NOTORCH_AVAILABLE, nanoagi.KARL_TXT, builtins.input) = saved
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # main
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import asyncio   # noqa: E402  (used by TestAsyncAlive)
     print("=" * 60)
     print("  nanoagi test suite — tests/")
     print("  KARL · MetaWeights · NanoAGI · Val · Chuck · Genome · self_improve")
