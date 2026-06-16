@@ -21,6 +21,7 @@ resonance is unbreakable.
 
 import os
 import sys
+import asyncio
 import math
 import random
 import struct
@@ -2309,11 +2310,101 @@ def repl(karl, meta, model):
 # VII. MAIN — boot and run
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─── ASYNC "ALIVE" MODE ──────────────────────────────────────────────────────
+# The beast that learns while it talks, hunts while it learns — the janus.doe
+# self-feeding dynamic, distributed across three concurrent coroutines:
+#   - conversation: you talk, Karl answers and ingests what you said
+#   - training:     Chuck trains in the background whenever there's a knowledge gap
+#   - hunting:      Karl scans for local/web food and eats it
+# One lock around KARL's mutable corpus/vocab keeps ingest/retokenize from racing a
+# generate or a train-encode. Blocking work (input, C training, hunting) is pushed to
+# a thread executor so the event loop never stalls — the loop stays alive and reactive.
+
+async def _sleep_or_stop(st, total):
+    """Sleep up to `total` seconds but wake within 0.5s of a shutdown request."""
+    waited = 0.0
+    while waited < total and st['running']:
+        await asyncio.sleep(0.5)
+        waited += 0.5
+
+
+async def _alive_conversation(karl, meta, model, st):
+    loop = asyncio.get_event_loop()
+    print("\n  [alive] Karl is awake — talking, learning, and hunting at once. 'quit' to stop.\n")
+    while st['running']:
+        try:
+            user_input = await loop.run_in_executor(None, lambda: input("\nkarl> "))
+        except (EOFError, KeyboardInterrupt):
+            st['running'] = False
+            break
+        if not user_input:
+            continue
+        if user_input.strip().lower() == 'quit':
+            st['running'] = False
+            break
+        async with st['karl_lock']:
+            text = await loop.run_in_executor(
+                None, lambda u=user_input: continue_phrase(u, karl, meta, model))
+            karl.ingest(user_input.encode('utf-8'))   # he learns from what you say
+        print(f"\n  {text}")
+
+
+async def _alive_training(karl, meta, model, st):
+    loop = asyncio.get_event_loop()
+    while st['running']:
+        await _sleep_or_stop(st, st['train_every'])
+        if not st['running']:
+            break
+        if not NOTORCH_AVAILABLE or meta.knowledge_gap() <= 0:
+            continue
+        async with st['karl_lock']:
+            corpus = open(KARL_TXT, 'rb').read() if os.path.exists(KARL_TXT) else b''
+            if len(corpus) < 200:
+                continue
+            token_ids = karl.encode(corpus)
+        # Train outside the lock on the snapshot — long-running, must not block talk.
+        await loop.run_in_executor(
+            None, lambda t=token_ids: chuck_train(karl, t, model, steps=st['train_steps'], meta=meta))
+
+
+async def _alive_hunting(karl, meta, model, st):
+    loop = asyncio.get_event_loop()
+    while st['running']:
+        await _sleep_or_stop(st, st['hunt_every'])
+        if not st['running']:
+            break
+        async with st['karl_lock']:
+            await loop.run_in_executor(
+                None, lambda: autoresearch_hunt(karl, KARL_TXT, meta=meta, model=model, max_rounds=1))
+
+
+async def alive(karl, meta, model, train_every=20.0, hunt_every=60.0, train_steps=50):
+    """Full-async 'alive' mode: talk, train, and hunt concurrently."""
+    st = {
+        'running': True,
+        'karl_lock': asyncio.Lock(),
+        'train_every': train_every,
+        'hunt_every': hunt_every,
+        'train_steps': train_steps,
+    }
+    await asyncio.gather(
+        _alive_conversation(karl, meta, model, st),
+        _alive_training(karl, meta, model, st),
+        _alive_hunting(karl, meta, model, st),
+        return_exceptions=True,
+    )
+
+
 def main():
     result = load_engine()
     if result[0] is None:
         return
     karl, meta, model = result
+
+    # Alive mode: python3 nanoagi.py --alive — talk + train + hunt concurrently
+    if '--alive' in sys.argv:
+        asyncio.run(alive(karl, meta, model))
+        return
 
     # Swarm mode: python3 nanoagi.py --swarm [N]
     if '--swarm' in sys.argv:
