@@ -215,7 +215,7 @@ void nt_tape_backward(int loss_idx);
 // Optimizers
 void  nt_tape_adam_step(float lr);
 void  nt_tape_adamw_step(float lr, float weight_decay, float beta1, float beta2);
-void  nt_tape_chuck_step(float lr, float loss_val);
+void  nt_tape_chuck_step(float lr, float loss_val, float beta1, float beta2);
 
 // Gradient utilities
 float nt_tape_clip_grads(float max_norm);

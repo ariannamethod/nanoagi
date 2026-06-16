@@ -59,7 +59,7 @@ _lib.nt_tape_no_decay.argtypes = [ctypes.c_int]
 _lib.nt_tape_backward.argtypes = [ctypes.c_int]
 _lib.nt_tape_clip_grads.restype = ctypes.c_float
 _lib.nt_tape_clip_grads.argtypes = [ctypes.c_float]
-_lib.nt_tape_chuck_step.argtypes = [ctypes.c_float, ctypes.c_float]
+_lib.nt_tape_chuck_step.argtypes = [ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float]
 _lib.nt_tape_adam_step.argtypes = [ctypes.c_float]
 _lib.nt_tape_adamw_step.argtypes = [ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float]
 _lib.nt_train_mode.argtypes = [ctypes.c_int]
@@ -354,9 +354,8 @@ class NotorchEngine:
         self.model = model
         self.lr = lr
         self.weight_decay = weight_decay
-        # beta1/beta2 are stored but NOT yet honored: Chuck (C) takes only (lr, loss) and
-        # owns its momentum internally. Wiring the beta genes through needs an extended
-        # nt_tape_chuck_step signature in the C core (TODO — Oleg's call on touching Chuck).
+        # beta1/beta2 feed Chuck's Adam-style momentum (m/v decay in nt_tape_chuck_step) —
+        # the C signature was extended to take them, so the evolved beta genes now matter.
         self.beta1 = beta1
         self.beta2 = beta2
         # Deduplicate tied weights (e.g. wte == lm_head)
@@ -467,7 +466,8 @@ class NotorchEngine:
         if update:
             _lib.nt_tape_backward(loss_idx)
             _lib.nt_tape_clip_grads(ctypes.c_float(1.0))
-            _lib.nt_tape_chuck_step(ctypes.c_float(self.lr), ctypes.c_float(loss_val))
+            _lib.nt_tape_chuck_step(ctypes.c_float(self.lr), ctypes.c_float(loss_val),
+                                    ctypes.c_float(self.beta1), ctypes.c_float(self.beta2))
             # Decoupled weight decay (AdamW-style): θ *= (1 - lr*wd). Honors the evolved
             # weight_decay gene, which used to be dropped (only lr reached the engine).
             if self.weight_decay > 0.0:

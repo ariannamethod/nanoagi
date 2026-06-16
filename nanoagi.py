@@ -2089,7 +2089,7 @@ def load_engine():
     return karl, meta, model
 
 
-def chuck_train(karl, token_ids, model, steps=200, meta=None):
+def chuck_train(karl, token_ids, model, steps=200, meta=None, ckpt_path='karl_chuck.nt'):
     """
     Chuck wakes up and trains real weights.
     Karl called. Smells like notorch. Time to work.
@@ -2104,6 +2104,22 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None):
     tmodel = NotorchNanoAGI(karl.vocab_size, n_embd=64, n_head=4, n_layer=3,
                             ctx=64, n_content=2, n_rrpram=2)
     engine = NotorchEngine(tmodel, lr=3e-4)
+
+    # Warm start: resume accumulated weights so Chuck's training is CUMULATIVE across
+    # rounds, not from scratch every call (Mythos #5: weights were warm-and-discarded).
+    # Guard on vocab — KARL's BPE grows, and a checkpoint from a smaller vocab has
+    # mismatched embedding shapes, so on a vocab change we honestly start fresh.
+    _vguard = ckpt_path + '.vocab'
+    if os.path.exists(ckpt_path) and os.path.exists(_vguard):
+        try:
+            _saved_vocab = int(open(_vguard).read().strip())
+        except Exception:
+            _saved_vocab = -1
+        if _saved_vocab == karl.vocab_size:
+            engine.load(ckpt_path)
+            print(f"  [Chuck] Resumed warm weights from {ckpt_path} — cumulative training.")
+        else:
+            print(f"  [Chuck] Vocab grew {_saved_vocab}->{karl.vocab_size}; fresh start (BPE retokenized).")
 
     ctx = 64
     losses = []
@@ -2128,6 +2144,11 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None):
         print(f"  [Chuck] Done. loss: {first:.2f} → {last:.2f} "
               f"({(first-last)/first*100:.0f}% improvement) [{elapsed:.1f}s]")
         print(f"  [Chuck] Karl, your weights are warm now.")
+        # Persist: the trained weights survive the call — warm AND alive, not discarded.
+        engine.save(ckpt_path)
+        with open(_vguard, 'w') as _vf:
+            _vf.write(str(karl.vocab_size))
+        print(f"  [Chuck] Weights persisted to {ckpt_path} — Karl actually remembers now.")
         if meta is not None:
             meta.chuck_trained_steps += steps
             gap = meta.knowledge_gap()

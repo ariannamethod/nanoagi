@@ -1393,8 +1393,8 @@ static float chuck_randn(void) {
 
 // Synced with PyTorch chuck.py (iamolegataeff/chuck.optimizer) 2026-04-06
 // θ -= (α × S × λ × λ_l) × m̂/(√v̂ + ε) + η
-void nt_tape_chuck_step(float lr, float loss_val) {
-    float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
+void nt_tape_chuck_step(float lr, float loss_val, float beta1, float beta2) {
+    float eps = 1e-8f;   // beta1/beta2 now arrive as args (evolved genes), no longer hardcoded
 
     // ── Level 1: Global loss trend → λ (dampen) ──
     nt_chuck_state* cs = &g_tape.chuck;
