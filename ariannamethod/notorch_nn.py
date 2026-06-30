@@ -16,12 +16,39 @@ import math
 import random
 import struct
 import subprocess
+import platform
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOAD libnotorch
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _dir = os.path.dirname(os.path.abspath(__file__))
+
+# Build type of the libnotorch we end up using: True = BLAS backend (fast matmul),
+# False = plain CPU naive matmul, None = pre-existing lib of unknown build.
+NOTORCH_BLAS = None
+
+
+def _compile_libnotorch(src, out):
+    """Compile libnotorch, preferring a BLAS backend for fast matmul (Accelerate on
+    macOS, OpenBLAS on Linux); fall back to the plain CPU build if the BLAS toolchain
+    isn't present. Same auto-detect-with-CPU-fallback rule as the GPU path. Returns
+    True if the BLAS build succeeded, False for the CPU fallback."""
+    base = ['cc', '-O2', '-std=c11', '-shared', '-fPIC']
+    if platform.system() == 'Darwin':
+        # notorch.c picks <Accelerate/Accelerate.h> only under -DACCELERATE (else <cblas.h>)
+        blas = base + ['-DUSE_BLAS', '-DACCELERATE', '-o', out, src, '-framework', 'Accelerate', '-lm']
+    else:
+        blas = base + ['-DUSE_BLAS', '-o', out, src, '-lopenblas', '-lm']
+    cpu = base + ['-o', out, src, '-lm']
+    for cmd, is_blas in ((blas, True), (cpu, False)):
+        try:
+            if subprocess.run(cmd, capture_output=True, text=True).returncode == 0:
+                return is_blas
+        except Exception:
+            pass
+    raise RuntimeError("libnotorch compile failed (both BLAS and CPU builds)")
+
 
 for ext in ['.dylib', '.so', '.dll']:
     _libpath = os.path.join(_dir, f'libnotorch{ext}')
@@ -31,8 +58,7 @@ else:
     _src = os.path.join(_dir, 'notorch.c')
     _libpath = os.path.join(_dir, 'libnotorch.dylib')
     if os.path.exists(_src):
-        subprocess.run(['cc', '-O2', '-std=c11', '-shared', '-fPIC',
-                       '-o', _libpath, _src, '-lm'], check=True)
+        NOTORCH_BLAS = _compile_libnotorch(_src, _libpath)
 
 _lib = ctypes.CDLL(_libpath)
 
