@@ -27,6 +27,7 @@ import random
 import struct
 import hashlib
 import time
+import json
 
 random.seed(42)
 
@@ -2140,6 +2141,62 @@ def load_engine():
     return karl, meta, model
 
 
+# ── Artifact bundle (R5): a manifest ties trained weights ↔ tokenizer ↔ architecture
+#    so a pushed checkpoint loads reproducibly and FAIL-CLOSED. The bare .vocab guard
+#    only caught vocab growth; an n_embd / n_layer change at the same vocab silently
+#    OOB-corrupted load. The manifest records the full arch + a KARL fingerprint.
+_CHUCK_FORMAT = 'nanoagi-chuck-v1'
+
+
+def _manifest_path(ckpt_path):
+    return ckpt_path + '.manifest'
+
+
+def _arch_of(m):
+    """Architecture signature — the fields that must match for a checkpoint to load
+    safely. ctx is `context_len` on the Python NanoAGI, `ctx` on the NotorchNanoAGI;
+    read whichever exists so the same signature works for both."""
+    return {
+        'vocab_size': m.vocab_size,
+        'n_embd': m.n_embd,
+        'n_head': m.n_head,
+        'n_layer': m.n_layer,
+        'ctx': getattr(m, 'context_len', getattr(m, 'ctx', None)),
+        'n_content': m.n_content,
+        'n_rrpram': m.n_rrpram,
+    }
+
+
+def _write_manifest(ckpt_path, tmodel, karl, steps):
+    arch = _arch_of(tmodel)
+    arch.update({
+        'format': _CHUCK_FORMAT,
+        'n_params': tmodel.n_params(),
+        'karl_merges': len(karl.merges),
+        'steps': steps,
+    })
+    with open(_manifest_path(ckpt_path), 'w') as f:
+        json.dump(arch, f, indent=2)
+
+
+def _read_manifest(ckpt_path):
+    """Return the manifest dict, or None if absent/unreadable. Legacy checkpoints
+    (only a .vocab sidecar, pre-R5) return None → caller uses the vocab-only path."""
+    mp = _manifest_path(ckpt_path)
+    if not os.path.exists(mp):
+        return None
+    try:
+        with open(mp) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _arch_matches(manifest, model):
+    """Fail-closed full-arch check: every architecture field must equal the model's."""
+    return all(manifest.get(k) == v for k, v in _arch_of(model).items())
+
+
 def chuck_train(karl, token_ids, model, steps=200, meta=None, ckpt_path='karl_chuck.nt'):
     """
     Chuck wakes up and trains real weights.
@@ -2152,27 +2209,37 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None, ckpt_path='karl_ch
     print(f"  [Chuck] Training {steps} steps on {len(token_ids)} tokens...")
 
     nt_seed(42)
-    tmodel = NotorchNanoAGI(karl.vocab_size, n_embd=64, n_head=4, n_layer=3,
-                            ctx=64, n_content=2, n_rrpram=2)
+    # Build the notorch model from the Python model's architecture — single source of
+    # truth, so the trained checkpoint and any later generation-rebuild can't drift.
+    tmodel = NotorchNanoAGI(karl.vocab_size, n_embd=model.n_embd, n_head=model.n_head,
+                            n_layer=model.n_layer, ctx=model.context_len,
+                            n_content=model.n_content, n_rrpram=model.n_rrpram)
     engine = NotorchEngine(tmodel, lr=3e-4)
 
     # Warm start: resume accumulated weights so Chuck's training is CUMULATIVE across
     # rounds, not from scratch every call (Mythos #5: weights were warm-and-discarded).
-    # Guard on vocab — KARL's BPE grows, and a checkpoint from a smaller vocab has
-    # mismatched embedding shapes, so on a vocab change we honestly start fresh.
+    # Fail-closed full-arch guard (R5): resume only when EVERY arch field matches the
+    # manifest — a same-vocab n_embd/n_layer change would OOB-corrupt the resume just
+    # like it corrupts a load. Legacy checkpoints (only a .vocab sidecar) fall back to
+    # the vocab-only check.
     resumed = False
-    _vguard = ckpt_path + '.vocab'
-    if os.path.exists(ckpt_path) and os.path.exists(_vguard):
-        try:
-            _saved_vocab = int(open(_vguard).read().strip())
-        except Exception:
-            _saved_vocab = -1
-        if _saved_vocab == karl.vocab_size:
-            engine.load(ckpt_path)
+    if os.path.exists(ckpt_path):
+        manifest = _read_manifest(ckpt_path)
+        if manifest is not None:
+            arch_ok = _arch_matches(manifest, tmodel)
+        else:
+            _vguard = ckpt_path + '.vocab'
+            arch_ok = False
+            if os.path.exists(_vguard):
+                try:
+                    arch_ok = int(open(_vguard).read().strip()) == karl.vocab_size
+                except Exception:
+                    arch_ok = False
+        if arch_ok and engine.load(ckpt_path):
             resumed = True
             print(f"  [Chuck] Resumed warm weights from {ckpt_path} — cumulative training.")
         else:
-            print(f"  [Chuck] Vocab grew {_saved_vocab}->{karl.vocab_size}; fresh start (BPE retokenized).")
+            print(f"  [Chuck] Checkpoint arch mismatch / unreadable; fresh start (BPE retokenized or arch changed).")
 
     # R4 ghost→flesh: on a FRESH start (no warm-resume), seed the model from metaweights
     # before training. Fulfills the README promise that metaweights seed the transformer
@@ -2181,7 +2248,7 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None, ckpt_path='karl_ch
     if not resumed and meta is not None:
         tmodel.seed_from_metaweights(meta)
 
-    ctx = 64
+    ctx = model.context_len
     losses = []
     t0 = time.time()
     for step in range(steps):
@@ -2205,10 +2272,12 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None, ckpt_path='karl_ch
               f"({(first-last)/first*100:.0f}% improvement) [{elapsed:.1f}s]")
         print(f"  [Chuck] Karl, your weights are warm now.")
         # Persist: the trained weights survive the call — warm AND alive, not discarded.
+        # The manifest (R5) bundles arch + KARL fingerprint so the checkpoint loads
+        # reproducibly and fail-closed (replaces the bare .vocab sidecar).
         engine.save(ckpt_path)
-        with open(_vguard, 'w') as _vf:
-            _vf.write(str(karl.vocab_size))
-        print(f"  [Chuck] Weights persisted to {ckpt_path} — Karl actually remembers now.")
+        total_steps = (meta.chuck_trained_steps + steps) if meta is not None else steps
+        _write_manifest(ckpt_path, tmodel, karl, total_steps)
+        print(f"  [Chuck] Weights persisted to {ckpt_path} (+manifest) — Karl actually remembers now.")
         if meta is not None:
             meta.chuck_trained_steps += steps
             gap = meta.knowledge_gap()
@@ -2231,16 +2300,26 @@ def _get_notorch_engine(model, ckpt_path='karl_chuck.nt'):
     """
     if not NOTORCH_AVAILABLE:
         return None
-    vguard = ckpt_path + '.vocab'
-    if not (os.path.exists(ckpt_path) and os.path.exists(vguard)):
+    if not os.path.exists(ckpt_path):
         return None
-    try:
-        saved_vocab = int(open(vguard).read().strip())
-    except Exception:
-        return None
-    if saved_vocab != model.vocab_size:
-        model._nt_engine = None   # vocab grew → cached engine is the wrong shape
-        return None
+    # Fail-closed arch guard (R5): prefer the manifest (full arch); fall back to the
+    # legacy .vocab sidecar (vocab-only) for pre-R5 checkpoints. Any mismatch → None,
+    # so generation never loads weights of the wrong shape.
+    manifest = _read_manifest(ckpt_path)
+    if manifest is not None:
+        if not _arch_matches(manifest, model):
+            model._nt_engine = None
+            return None
+    else:
+        vguard = ckpt_path + '.vocab'
+        if not os.path.exists(vguard):
+            return None
+        try:
+            if int(open(vguard).read().strip()) != model.vocab_size:
+                model._nt_engine = None
+                return None
+        except Exception:
+            return None
     eng = getattr(model, '_nt_engine', None)
     if eng is None or getattr(model, '_nt_engine_vocab', None) != model.vocab_size:
         nt_model = NotorchNanoAGI(model.vocab_size, n_embd=model.n_embd,

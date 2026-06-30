@@ -555,16 +555,30 @@ class NotorchEngine:
         _lib.nt_save(path.encode(), arr, n)
 
     def load(self, path):
+        """Fail-closed weight restore. Verifies param count AND every tensor size
+        BEFORE mutating any weight, so a mismatched checkpoint can never half-load or
+        read past the source (OOB). Returns False on any mismatch — the caller treats
+        that as "do not use these weights" and falls back. Frees all loaded tensors.
+        """
         n_loaded = ctypes.c_int(0)
         loaded = _lib.nt_load(path.encode(), ctypes.byref(n_loaded))
         if not loaded:
             return False
-        for i in range(min(n_loaded.value, len(self.params))):
-            src = _get_ts(loaded[i])
-            dst = _get_ts(self.params[i]._ptr)
-            ctypes.memmove(dst.data, src.data, dst.len * 4)
+        nl = n_loaded.value
+        ok = (nl == len(self.params))
+        if ok:
+            for i in range(nl):
+                if _get_ts(loaded[i]).len != _get_ts(self.params[i]._ptr).len:
+                    ok = False
+                    break
+        if ok:
+            for i in range(nl):
+                src = _get_ts(loaded[i])
+                dst = _get_ts(self.params[i]._ptr)
+                ctypes.memmove(dst.data, src.data, dst.len * 4)
+        for i in range(nl):
             _lib.nt_tensor_free(loaded[i])
-        return True
+        return ok
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
