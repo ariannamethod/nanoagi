@@ -341,6 +341,41 @@ class NotorchNanoAGI(Module):
               f"heads={n_head} (content={n_content}, rrpram={n_rrpram}), "
               f"layers={n_layer}, ctx={ctx}")
 
+    def seed_from_metaweights(self, meta):
+        """Ghost → flesh: seed the (tied) embedding from corpus statistics, mirroring the
+        pure-Python NanoAGI.init_from_metaweights, but iterating the SPARSE hebbian dict
+        instead of O(V^2) pair scanning (load-bearing at vocab in the thousands). lm_head
+        is weight-tied to wte (one tensor), so only the embedding is seeded — the output
+        head inherits the seed for free. Two-pass (accumulate from the original ghost, then
+        apply) so the result is order-independent. Fulfills the README promise that the
+        metaweights seed the transformer that actually trains, not just the REPL ghost."""
+        V, E = self.vocab_size, self.n_embd
+        scale = 0.15
+        ts = _get_ts(self.wte.weight._ptr)
+        signal = [0.0] * (V * E)
+        neighbors = [0] * V
+        for key, strength in meta.hebbian.items():
+            if strength <= 0.01:
+                continue
+            a, b = key
+            if a >= V or b >= V or a == b:
+                continue
+            ba, bb = a * E, b * E
+            for d in range(E):
+                signal[ba + d] += strength * ts.data[bb + d]
+                signal[bb + d] += strength * ts.data[ba + d]
+            neighbors[a] += 1
+            neighbors[b] += 1
+        seeded = 0
+        for a in range(V):
+            if neighbors[a] > 0:
+                inv = scale / neighbors[a]
+                ba = a * E
+                for d in range(E):
+                    ts.data[ba + d] += inv * signal[ba + d]
+                seeded += 1
+        print(f"  [NotorchNanoAGI] Seeded from metaweights (ghost → flesh): {seeded}/{V} tokens.")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TRAINING ENGINE — forward/backward/step through notorch tape

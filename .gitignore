@@ -1,6 +1,8 @@
 karl.mem
 chuck.mem
 results.tsv
+karl_chuck.nt
+karl_chuck.nt.vocab
 __pycache__/
 *.pyc
 ariannamethod/libnotorch.dylib

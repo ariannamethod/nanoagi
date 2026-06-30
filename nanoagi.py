@@ -2045,6 +2045,12 @@ def load_engine():
     karl_tmp = KARL()  # temp instance for ingestion tracking
     autoresearch(karl_tmp, KARL_TXT, min_bytes=50000)
 
+    # F11 fix (Codex audit): autoresearch may have grown karl.txt — re-read so KARL
+    # tokenizes the ACTUAL (possibly hunted) corpus, not the stale pre-autoresearch
+    # buffer read above.
+    with open(KARL_TXT, 'rb') as f:
+        raw_data = f.read()
+
     # KARL tokenizer
     print(f"\n[3] KARL tokenizer...")
     karl = KARL(max_merges=2048)
@@ -2110,6 +2116,7 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None, ckpt_path='karl_ch
     # rounds, not from scratch every call (Mythos #5: weights were warm-and-discarded).
     # Guard on vocab — KARL's BPE grows, and a checkpoint from a smaller vocab has
     # mismatched embedding shapes, so on a vocab change we honestly start fresh.
+    resumed = False
     _vguard = ckpt_path + '.vocab'
     if os.path.exists(ckpt_path) and os.path.exists(_vguard):
         try:
@@ -2118,9 +2125,17 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None, ckpt_path='karl_ch
             _saved_vocab = -1
         if _saved_vocab == karl.vocab_size:
             engine.load(ckpt_path)
+            resumed = True
             print(f"  [Chuck] Resumed warm weights from {ckpt_path} — cumulative training.")
         else:
             print(f"  [Chuck] Vocab grew {_saved_vocab}->{karl.vocab_size}; fresh start (BPE retokenized).")
+
+    # R4 ghost→flesh: on a FRESH start (no warm-resume), seed the model from metaweights
+    # before training. Fulfills the README promise that metaweights seed the transformer
+    # that ACTUALLY trains — not just the Python REPL ghost. Skipped on warm-resume:
+    # seeding already-trained weights would corrupt them.
+    if not resumed and meta is not None:
+        tmodel.seed_from_metaweights(meta)
 
     ctx = 64
     losses = []
