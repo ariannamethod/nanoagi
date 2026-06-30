@@ -1804,12 +1804,50 @@ def _find_doe_binary():
     return None
 
 
-def _doe_serve_start(binary, gguf_path, port=8779, ready_timeout=90):
+def _free_port():
+    """An OS-assigned free localhost port — avoids a fixed-port false-ready (a stale
+    server on a hardcoded port answering our health poll)."""
+    import socket
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def _kill_proc(proc):
+    """Terminate → wait → kill → wait, so no orphan/zombie DoE server is left behind."""
+    if proc is None:
+        return
+    try:
+        proc.terminate(); proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill(); proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ''
+
+
+def _doe_serve_start(binary, gguf_path, port=None, ready_timeout=90):
     """Start DoE as a local OpenAI-compatible server on the coder GGUF and wait until it
-    answers. Returns the subprocess handle, or None on failure (caller falls back).
-    self_code stops it when done."""
+    answers. Uses an OS-assigned free port so a stale server can't false-ready. Returns
+    the subprocess handle, or None on failure (caller falls back). self_code stops it."""
     import subprocess, time as _t
     from urllib.request import urlopen
+    if port is None:
+        port = _free_port()
     try:
         proc = subprocess.Popen(
             [binary, '--model', gguf_path, '--serve', str(port),
@@ -1830,20 +1868,13 @@ def _doe_serve_start(binary, gguf_path, port=8779, ready_timeout=90):
         except Exception:
             _t.sleep(2)
     print(f"  [ENV] DoE serve not ready in {ready_timeout}s")
-    try: proc.terminate()
-    except Exception: pass
+    _kill_proc(proc)
     return None
 
 
 def _stop_llm(llm):
-    """Stop a DoE server started by _find_llm (no-op for ollama/llamacpp/none)."""
-    proc = (llm or {}).get('proc')
-    if proc is not None:
-        try:
-            proc.terminate(); proc.wait(timeout=5)
-        except Exception:
-            try: proc.kill()
-            except Exception: pass
+    """Stop a DoE server started by _find_llm (no-op for ollama / none)."""
+    _kill_proc((llm or {}).get('proc'))
 
 
 def _scan_local_ggufs():
@@ -1880,8 +1911,9 @@ def _download_coder_gguf(dest_dir, key=None):
         return None
     dest = os.path.join(dest_dir, fname)
     part = dest + '.part'
-    # already present + integrity-verified?
-    if os.path.exists(dest) and os.path.getsize(dest) == size:
+    # already present? trust ONLY if size AND pinned sha256 match — a corrupt or malicious
+    # same-size file must never be served. Mismatch → fall through and re-download.
+    if os.path.exists(dest) and os.path.getsize(dest) == size and _sha256_file(dest) == sha:
         return dest
     if os.path.exists(part):
         try: os.remove(part)   # stale partial — start clean
@@ -1929,16 +1961,16 @@ def _find_llm():
     Find an LLM for self-code. Global coder-preference: no generic/unidentified backend
     ever precedes a real coder we can obtain. Direct GGUF download — never a hosted API.
 
-    Returns dict: {'type': 'ollama'|'llamacpp'|'gguf'|None,
-                   'url': ..., 'model': ..., 'gguf_path': ..., 'binary': ...}
+    Returns dict: {'type': 'ollama'|'doe'|None,
+                   'url': ..., 'model': ..., 'gguf_path': ..., 'binary': ..., 'proc': ...}
 
     Order (coder-first; GGUFs run through DoE — our engine, never llama.cpp):
-      1. Ollama with a coder model
-      2. llama.cpp server, only if its loaded model identifies as a coder
-      3. local coder GGUF (filename has 'coder') → served by DoE
-      4. download a whitelisted coder GGUF directly from HF → served by DoE
-      5. last-resort generic: any Ollama model / llama.cpp server / generic GGUF via DoE
-      6. nothing — blind mutation
+      1. Ollama with a coder model (local server; not llama.cpp)
+      2. local coder GGUF (filename has 'coder') → served by DoE
+      3. download a whitelisted coder GGUF directly from HF → served by DoE
+      4. last-resort generic: any Ollama model / generic GGUF via DoE
+      5. nothing — blind mutation
+    No llama.cpp anywhere: GGUFs run only through DoE, our own engine.
     """
     from urllib.request import urlopen, Request
     import json as _json
@@ -1946,26 +1978,13 @@ def _find_llm():
     env = {'type': None, 'url': None, 'model': None, 'token': None,
            'gguf_path': None, 'binary': None, 'proc': None}
     OLL = 'http://localhost:11434/v1/chat/completions'
-    LCP = 'http://localhost:8080/v1/chat/completions'
-    DOE_PORT = 8779
+    DOE_PORT = _free_port()
 
-    # gather availability
+    # gather availability (Ollama is a distinct local daemon; we do NOT probe llama.cpp)
     ollama_models = []
     try:
         r = urlopen('http://localhost:11434/api/tags', timeout=3)
         ollama_models = [m['name'] for m in _json.loads(r.read()).get('models', [])]
-    except Exception:
-        pass
-    llamacpp_up, llamacpp_model = False, None
-    try:
-        r = urlopen('http://localhost:8080/health', timeout=3)
-        if r.status == 200:
-            llamacpp_up = True
-            try:
-                rm = urlopen('http://localhost:8080/v1/models', timeout=3)
-                llamacpp_model = (_json.loads(rm.read()).get('data') or [{}])[0].get('id')
-            except Exception:
-                llamacpp_model = None
     except Exception:
         pass
     doe = _find_doe_binary()
@@ -1987,35 +2006,26 @@ def _find_llm():
         env.update(type='ollama', url=OLL, model=ocoders[0])
         print(f"  [ENV] Ollama coder model: {ocoders[0]}")
         return env
-    # 2. llama.cpp server identified as a coder
-    if llamacpp_up and _is_coder_name(llamacpp_model):
-        env.update(type='llamacpp', url=LCP, model=llamacpp_model or 'local')
-        print(f"  [ENV] llama.cpp server coder model: {llamacpp_model}")
-        return env
-    # 3. local coder GGUF → DoE
+    # 2. local coder GGUF → DoE
     if doe and local_coders and _serve(min(local_coders, key=os.path.getsize), 'local coder'):
         return env
-    # 4. download a whitelisted coder GGUF directly → DoE
+    # 3. download a whitelisted coder GGUF directly → DoE
     if doe:
         dl = _download_coder_gguf(os.path.expanduser('~/models'))
         if dl and _serve(dl, 'downloaded coder'):
             return env
-    # 5. last-resort generic (only after we failed to get a real coder)
+    # 4. last-resort generic (only after we failed to get a real coder)
     if ollama_models:
         env.update(type='ollama', url=OLL, model=ollama_models[0])
         print(f"  [ENV] generic Ollama model (no coder available): {ollama_models[0]}")
-        return env
-    if llamacpp_up:
-        env.update(type='llamacpp', url=LCP, model=llamacpp_model or 'local')
-        print(f"  [ENV] generic llama.cpp server (model unidentified)")
         return env
     if doe and local_ggufs:
         big = [p for p in local_ggufs if os.path.getsize(p) > 500_000_000]
         pick = min(big, key=os.path.getsize) if big else min(local_ggufs, key=os.path.getsize)
         if _serve(pick, 'generic GGUF'):
             return env
-    # 6. nothing
-    print(f"  [ENV] No coder (no Ollama / llama.cpp-server / DoE+GGUF). self_code → blind.")
+    # 5. nothing
+    print(f"  [ENV] No coder (no Ollama / DoE+GGUF). self_code → blind mutation.")
     return env
 
 
@@ -2030,7 +2040,7 @@ def _llm_chat(llm_env, system_prompt, user_prompt, max_tokens=800, temperature=0
 
     ctx = ssl.create_default_context()   # verify on + check_hostname (was CERT_NONE — corpus-poisoning vector for a self-feeding organism)
 
-    if llm_env['type'] in ('ollama', 'llamacpp'):   # local servers only — no hosted API
+    if llm_env['type'] == 'ollama':   # local Ollama daemon only — no llama.cpp, no hosted API
         payload = _json.dumps({
             "model": llm_env['model'],
             "messages": [
@@ -2095,9 +2105,9 @@ def self_code(karl, karl_txt_path, max_attempts=3):
     The organism reads its own source code, sends it to a code LLM,
     applies the suggested improvement, tests it, keeps or reverts.
 
-    Survival chain: Ollama coder → llama.cpp coder → local coder GGUF → DIRECT coder
-    GGUF download from HF (no token) → generic local LLM → blind mutation. No hosted API.
-    The organism does not ask permission. It finds a way or makes one.
+    Survival chain: Ollama coder → local coder GGUF (DoE) → DIRECT coder GGUF download
+    from HF (no token) → DoE-served generic GGUF → blind mutation. No llama.cpp, no
+    hosted API. The organism does not ask permission. It finds a way or makes one.
     """
     try:
         from urllib.request import urlopen, Request
@@ -2149,62 +2159,61 @@ def self_code(karl, karl_txt_path, max_attempts=3):
     # Backup source
     backup = source
 
-    for attempt in range(max_attempts):
-        print(f"\n  [SELF-CODE] Attempt {attempt+1}/{max_attempts}")
+    try:
+        for attempt in range(max_attempts):
+            print(f"\n  [SELF-CODE] Attempt {attempt+1}/{max_attempts}")
 
-        text = _llm_chat(llm, SELF_CODE_PROMPT,
-                         f"Here is the source code:\n\n```python\n{context}\n```")
-        if not text:
-            continue
-
-        # Parse JSON patch from response
-        try:
-            # Extract JSON from response
-            start = text.find('{')
-            end = text.rfind('}') + 1
-            if start < 0 or end <= start:
-                print(f"  [SELF-CODE] No JSON in response. Retrying.")
+            text = _llm_chat(llm, SELF_CODE_PROMPT,
+                             f"Here is the source code:\n\n```python\n{context}\n```")
+            if not text:
                 continue
 
-            patch = _json.loads(text[start:end])
-            old_code = patch.get('old_code', '')
-            new_code = patch.get('new_code', '')
-            desc = patch.get('description', 'unknown')
-
-            if not old_code or not new_code:
-                print(f"  [SELF-CODE] Empty patch. Retrying.")
+            # Parse JSON patch from response
+            try:
+                start = text.find('{')
+                end = text.rfind('}') + 1
+                if start < 0 or end <= start:
+                    print(f"  [SELF-CODE] No JSON in response. Retrying.")
+                    continue
+                patch = _json.loads(text[start:end])
+                if not isinstance(patch, dict):
+                    print(f"  [SELF-CODE] JSON is not an object. Retrying.")
+                    continue
+                old_code = patch.get('old_code', '')
+                new_code = patch.get('new_code', '')
+                desc = patch.get('description', 'unknown')
+                if not old_code or not new_code:
+                    print(f"  [SELF-CODE] Empty patch. Retrying.")
+                    continue
+                print(f"  [SELF-CODE] Suggestion: {desc}")
+            except (_json.JSONDecodeError, KeyError, AttributeError, TypeError, ValueError) as e:
+                print(f"  [SELF-CODE] Parse error: {e}. Retrying.")
                 continue
 
-            print(f"  [SELF-CODE] Suggestion: {desc}")
+            # Apply patch
+            if old_code not in source:
+                print(f"  [SELF-CODE] old_code not found in source. Retrying.")
+                continue
 
-        except (_json.JSONDecodeError, KeyError) as e:
-            print(f"  [SELF-CODE] Parse error: {e}. Retrying.")
-            continue
+            _atomic_write(src_path, source.replace(old_code, new_code, 1))
+            print(f"  [SELF-CODE] Patch applied.")
 
-        # Apply patch
-        if old_code not in source:
-            print(f"  [SELF-CODE] old_code not found in source. Retrying.")
-            continue
+            # Test with the suite's own runner (pytest isn't installed → old gate always reverted)
+            test_dir = os.path.join(os.path.dirname(src_path), 'tests')
+            if _run_test_suite(test_dir):
+                print(f"  [SELF-CODE] Tests PASS. Keeping patch: {desc}")
+                return {'description': desc, 'old_code': old_code,
+                        'new_code': new_code, 'status': 'applied'}
+            print(f"  [SELF-CODE] Tests FAIL. Reverting.")
 
-        _atomic_write(src_path, source.replace(old_code, new_code, 1))
-        print(f"  [SELF-CODE] Patch applied.")
+            # Revert
+            _atomic_write(src_path, backup)
+            source = backup
 
-        # Test with the suite's own runner (pytest isn't installed → old gate always reverted)
-        test_dir = os.path.join(os.path.dirname(src_path), 'tests')
-        if _run_test_suite(test_dir):
-            print(f"  [SELF-CODE] Tests PASS. Keeping patch: {desc}")
-            _stop_llm(llm)
-            return {'description': desc, 'old_code': old_code,
-                    'new_code': new_code, 'status': 'applied'}
-        print(f"  [SELF-CODE] Tests FAIL. Reverting.")
-
-        # Revert
-        _atomic_write(src_path, backup)
-        source = backup
-
-    print(f"\n  [SELF-CODE] {max_attempts} attempts exhausted. No improvement applied.")
-    _stop_llm(llm)
-    return None
+        print(f"\n  [SELF-CODE] {max_attempts} attempts exhausted. No improvement applied.")
+        return None
+    finally:
+        _stop_llm(llm)   # always stop the DoE server — even on keep, exhaust, or error
 
 
 # ─────────────────────────────────────────────────────────────────────────────

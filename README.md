@@ -412,22 +412,20 @@ When `self_code` needs an LLM, it doesn't ask you for an API key. It scans the e
 
 ```
   1. Ollama (localhost:11434)     → check /api/tags, prefer coder models
-  2. llama.cpp server (:8080)    → check /health
-  3. Local coder GGUF + llama-cli → scan ~/Downloads, ~/.cache, ~/models for *coder*.gguf
-  4. Download a coder GGUF directly from HF → no token, verified by pinned sha256, run via llama-cli
-  5. Blind mutation               → random targeted AST changes, test, keep or revert
+  2. Local coder GGUF + DoE       → scan ~/Downloads, ~/.cache, ~/models for *coder*.gguf
+  3. Download a coder GGUF directly from HF → no token, pinned sha256, served by DoE
+  4. Blind mutation               → random targeted changes, test, keep or revert
 ```
 
-On a Mac with llama.cpp installed and some GGUFs lying around, this happens:
+On a Mac with a coder GGUF lying around (or none — it downloads one), this happens:
 ```
-  [ENV] GGUF found: /Users/you/Downloads/weights/small-yent-f16.gguf (642MB)
-  [ENV] Binary: /usr/local/bin/llama-cli
-  [ENV] Scanned 38 GGUFs across 6 dirs
+  [ENV] DoE serving local coder: qwen2.5-coder-1.5b-instruct-q4_k_m.gguf (:8779)
+  [ENV] Binary: ~/arianna/doe/doe_field
 ```
 
-No token. No Ollama. No internet. The organism found a 642MB GGUF on disk, found `llama-cli` in PATH, and got to work. When you're dying of thirst, you don't ask for credentials — you find water.
+No token. No hosted API. The organism found a coder GGUF on disk (or fetched one directly from HF, verified by pinned sha256), and ran it on **DoE** — our own engine. When you're dying of thirst, you don't ask for credentials — you find water.
 
-*(previous versions of nanoagi would print "No HF_TOKEN. Set HF_TOKEN env var for API access" and give up. an organism that gives up is not an organism. it's a form with a required field. this has been corrected.)*
+*(previous versions gave up without a hosted API key. an organism that gives up is not an organism. now it downloads its own coder and runs it on DoE — no key, ever.)*
 
 ```bash
 # just run it — it finds its own LLM
@@ -471,7 +469,7 @@ The safety loop:
 4. Tests pass → **keep**. Tests fail → **revert to backup**.
 5. Repeat up to `max_attempts`
 
-The LLM is whatever the organism can find. Ollama running locally? It'll use that. A GGUF file and `llama-cli` on disk? It'll use that. HF_TOKEN set? Router API. Nothing at all? Blind targeted mutations — swap activations, tweak learning rates, test, keep or revert. The prompt is hardcoded: "suggest ONE small, concrete improvement, return JSON with old_code/new_code."
+The LLM is whatever the organism can find. Ollama running locally with a coder model? It'll use that. A coder GGUF on disk (or downloaded directly from HF, no token)? **DoE** serves it — our own generic-GGUF engine, no llama.cpp. Nothing at all? Blind targeted mutations — tweak field coefficients and learning rates, test, keep or revert. The prompt is hardcoded: "suggest ONE small, concrete improvement, return JSON with old_code/new_code."
 
 ### horizontal gene transfer — autonomous self-code trigger
 
@@ -496,7 +494,7 @@ evolve running...
 
 Like horizontal gene transfer in bacteria: when your own mutations can't save you, pull DNA from outside. Bacteria have done this for 4 billion years. nanoagi learned it today.
 
-Configurable: `stagnation_threshold=10`, `auto_self_code=True`. No API key required — the organism scans for Ollama, llama.cpp, local GGUFs, HF API, and falls back to blind mutations. It does not give up. It does not ask permission. It finds a way.
+Configurable: `stagnation_threshold=10`. `auto_self_code` is opt-in (default off — enable with `python3 nanoagi.py --self-evolve` or REPL `autoself on`). No API key required — the organism scans for Ollama, local coder GGUFs (served by DoE), or downloads a coder directly, and falls back to blind mutations. It does not give up. It does not ask permission. It finds a way.
 
 ## swarm — release the hyenas
 
@@ -529,7 +527,7 @@ karl> swarm 6
   SWARM COMPLETE — 4 hyenas returned
   Pack leader: hyena-2 (bpb=6.9821)
   Best genome: Genome(embd=96, head=2, ...)
-  Time: 45s (vs ~180s sequential)
+  Time: 180s (4 hyenas, sequential)
 ============================================================
 ```
 
@@ -547,7 +545,7 @@ Each hyena runs in turn. notorch's training tape is a single global, so running 
 | 4+ | *(automatic)* | **Stagnation in evolve triggers selfcode autonomously** (horizontal gene transfer) |
 | 5 | `swarm` | **Release hyenas** — sequential genome exploration, pack shares findings |
 
-Level 0 is a transformer. Level 1 is a transformer that feeds itself. Level 2 is a transformer that redesigns itself. Level 3 is a transformer that redesigns itself while choosing its own training data. Level 4 is a transformer that scans its filesystem for coder GGUFs, checks if Ollama is running, tries llama.cpp, downloads a coder GGUF directly from HuggingFace (no token), and if absolutely nothing exists, mutates itself blind — then asks that LLM to rewrite its source code. Level 4+ is a transformer that *decides for itself* when to ask. Level 5 is a pack of transformers doing all of the above in sequence (one shared global training tape).
+Level 0 is a transformer. Level 1 is a transformer that feeds itself. Level 2 is a transformer that redesigns itself. Level 3 is a transformer that redesigns itself while choosing its own training data. Level 4 is a transformer that scans its filesystem for coder GGUFs, checks if Ollama is running, downloads a coder GGUF directly from HuggingFace (no token) and serves it on DoE — our own engine, no llama.cpp — and if absolutely nothing exists, mutates itself blind, then asks that LLM to rewrite its source code. Level 4+ is a transformer that *decides for itself* when to ask. Level 5 is a pack of transformers doing all of the above in sequence (one shared global training tape).
 
 At no level does it ask for permission. At no level does it require an API key.
 

@@ -1120,6 +1120,227 @@ class TestAsyncAlive(unittest.TestCase):
              nanoagi.NOTORCH_AVAILABLE, nanoagi.KARL_TXT, builtins.input) = saved
 
 
+class _FakeResp:
+    """Minimal urlopen() stand-in for _download_coder_gguf: a context manager whose
+    read(n) streams fixed bytes (no network)."""
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+    def read(self, n=-1):
+        end = len(self.data) if (n is None or n < 0) else self.pos + n
+        chunk = self.data[self.pos:end]
+        self.pos += len(chunk)
+        return chunk
+
+
+class TestReaudit(unittest.TestCase):
+    """Re-audit coverage: the coder/DoE path, README-reconciled behavior, and the
+    branches the prior audit never exercised. No network, no real model load."""
+
+    def test_no_llama_cli_path(self):
+        with open(nanoagi.__file__) as _f:
+            src = _f.read()
+        self.assertNotIn('llama-cli', src)          # banned binary — coder runs on DoE
+        self.assertNotIn('_find_llama_cli', src)
+        self.assertNotIn('localhost:8080', src)     # llama.cpp server probe — gone
+        self.assertNotIn("type='llamacpp'", src)
+        self.assertNotIn("'llamacpp'", src)         # no live llamacpp branch
+
+    def test_no_hosted_coder_api(self):
+        with open(nanoagi.__file__) as _f:
+            src = _f.read()
+        self.assertNotIn('router.huggingface.co', src)
+        self.assertNotIn("type='hf'", src)
+        self.assertNotIn('HF_TOKEN', src)
+        self.assertNotIn('Authorization', src)
+
+    def test_coder_whitelist_mandatory_sha(self):
+        wl = nanoagi._CODER_GGUF_WHITELIST
+        self.assertGreater(len(wl), 0)
+        for key, (repo, fname, size, sha) in wl.items():
+            self.assertTrue(repo and fname)
+            self.assertIsInstance(size, int)
+            self.assertGreater(size, 0)
+            self.assertRegex(sha, r'^[0-9a-f]{64}$', f'{key}: pinned sha256 required')
+
+    def test_download_coder_unwhitelisted_none(self):
+        self.assertIsNone(nanoagi._download_coder_gguf('/tmp/nano_audit_x', 'nope'))
+
+    def test_download_coder_sha_match_ok_and_cached(self):
+        import unittest.mock as mock, tempfile, hashlib, os as _os
+        data = b'tiny coder bytes ' * 7
+        sha = hashlib.sha256(data).hexdigest()
+        tmp = tempfile.mkdtemp(); key = '_t'
+        wl = dict(nanoagi._CODER_GGUF_WHITELIST); wl[key] = ('r/r', 't.gguf', len(data), sha)
+        with mock.patch.object(nanoagi, '_CODER_GGUF_WHITELIST', wl), \
+             mock.patch('urllib.request.urlopen', return_value=_FakeResp(data)):
+            out = nanoagi._download_coder_gguf(tmp, key)
+            out2 = nanoagi._download_coder_gguf(tmp, key)   # existing file: sha trusted, no re-dl
+        self.assertEqual(out, _os.path.join(tmp, 't.gguf'))
+        self.assertEqual(out2, out)
+        with open(out, 'rb') as f:
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), sha)
+
+    def test_download_coder_sha_mismatch_rejected(self):
+        import unittest.mock as mock, tempfile, os as _os
+        data = b'wrong coder bytes ' * 7
+        tmp = tempfile.mkdtemp(); key = '_t'
+        wl = dict(nanoagi._CODER_GGUF_WHITELIST); wl[key] = ('r/r', 't.gguf', len(data), 'f'*64)
+        with mock.patch.object(nanoagi, '_CODER_GGUF_WHITELIST', wl), \
+             mock.patch('urllib.request.urlopen', return_value=_FakeResp(data)):
+            out = nanoagi._download_coder_gguf(tmp, key)
+        self.assertIsNone(out)
+        self.assertFalse(_os.path.exists(_os.path.join(tmp, 't.gguf')))
+        self.assertFalse(_os.path.exists(_os.path.join(tmp, 't.gguf.part')))  # .part cleaned
+
+    def test_download_coder_size_mismatch_rejected(self):
+        import unittest.mock as mock, tempfile, os as _os
+        tmp = tempfile.mkdtemp(); key = '_t'
+        wl = dict(nanoagi._CODER_GGUF_WHITELIST); wl[key] = ('r/r', 't.gguf', 999999, 'a'*64)
+        with mock.patch.object(nanoagi, '_CODER_GGUF_WHITELIST', wl), \
+             mock.patch('urllib.request.urlopen', return_value=_FakeResp(b'short')):
+            out = nanoagi._download_coder_gguf(tmp, key)
+        self.assertIsNone(out)
+        self.assertFalse(_os.path.exists(_os.path.join(tmp, 't.gguf.part')))
+
+    def test_download_coder_stale_part_cleaned(self):
+        import unittest.mock as mock, tempfile, hashlib, os as _os
+        good = b'fresh coder' * 6
+        sha = hashlib.sha256(good).hexdigest()
+        tmp = tempfile.mkdtemp(); key = '_t'
+        wl = dict(nanoagi._CODER_GGUF_WHITELIST); wl[key] = ('r/r', 't.gguf', len(good), sha)
+        with open(_os.path.join(tmp, 't.gguf.part'), 'wb') as f:
+            f.write(b'garbage from an interrupted prior download')   # STALE .part
+        with mock.patch.object(nanoagi, '_CODER_GGUF_WHITELIST', wl), \
+             mock.patch('urllib.request.urlopen', return_value=_FakeResp(good)):
+            out = nanoagi._download_coder_gguf(tmp, key)
+        self.assertEqual(out, _os.path.join(tmp, 't.gguf'))
+        with open(out, 'rb') as f:
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), sha)   # fresh, not garbage
+        self.assertFalse(_os.path.exists(_os.path.join(tmp, 't.gguf.part')))
+
+    def test_download_coder_existing_bad_sha_not_trusted(self):
+        import unittest.mock as mock, tempfile, hashlib, os as _os
+        good = b'good coder' * 5
+        sha = hashlib.sha256(good).hexdigest()
+        tmp = tempfile.mkdtemp(); key = '_t'
+        wl = dict(nanoagi._CODER_GGUF_WHITELIST); wl[key] = ('r/r', 't.gguf', len(good), sha)
+        with open(_os.path.join(tmp, 't.gguf'), 'wb') as f:
+            f.write(b'XXXX coder' * 5)   # corrupt, SAME size
+        with mock.patch.object(nanoagi, '_CODER_GGUF_WHITELIST', wl), \
+             mock.patch('urllib.request.urlopen', return_value=_FakeResp(good)):
+            out = nanoagi._download_coder_gguf(tmp, key)   # must NOT trust corrupt → re-download
+        with open(out, 'rb') as f:
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), sha)
+
+    def test_is_coder_name(self):
+        self.assertTrue(nanoagi._is_coder_name('qwen2.5-coder-3b.gguf'))
+        self.assertTrue(nanoagi._is_coder_name('a-code-model'))
+        self.assertFalse(nanoagi._is_coder_name('yent-24b-boundary.gguf'))
+        self.assertFalse(nanoagi._is_coder_name(None))
+
+    def test_find_llm_no_backend_blind(self):
+        import unittest.mock as mock
+        with mock.patch.object(nanoagi, '_find_doe_binary', return_value=None), \
+             mock.patch.object(nanoagi, '_scan_local_ggufs', return_value=[]):
+            env = nanoagi._find_llm()
+        self.assertIn(env['type'], (None, 'ollama'))   # never llamacpp/doe without a coder
+        if env['type'] is None:
+            self.assertIsNone(env.get('proc'))   # no DoE/coder → no server started
+
+    def test_llm_chat_doe_sse_parse(self):
+        import unittest.mock as mock
+        sse = [b'data: {"token":"he"}\n', b'\n',
+               b'data: {"token":"llo"}\n', b'data: {"done":true}\n']
+
+        class _Resp:
+            def __iter__(self):
+                return iter(sse)
+
+        with mock.patch('urllib.request.urlopen', return_value=_Resp()):
+            env = {'type': 'doe', 'url': 'http://127.0.0.1:9/v1/chat/completions'}
+            out = nanoagi._llm_chat(env, 'sys', 'user', max_tokens=8, temperature=0.1)
+        self.assertEqual(out, 'hello')
+
+    def test_stop_llm(self):
+        import unittest.mock as mock
+        proc = mock.Mock()
+        nanoagi._stop_llm({'proc': proc})
+        proc.terminate.assert_called_once()
+        nanoagi._stop_llm({'proc': None})   # no crash
+        nanoagi._stop_llm(None)             # no crash
+
+    def test_self_code_prompt_fits_doe(self):
+        # the COMBINED system + user message must fit DoE serve's ~2048-byte user_msg buffer
+        with open(nanoagi.__file__) as _f:
+            src = _f.read().split('\n')
+        markers = ['class NanoAGI:', 'class Genome:', 'def chuck_train(',
+                   'def _evaluate_genome(', 'class KARL:', 'class MetaWeights:',
+                   'def self_improve(']
+        secs = []
+        for i, line in enumerate(src):
+            if any(m in line for m in markers):
+                secs.append('\n'.join(src[max(0, i-2):min(len(src), i+60)]))
+        import random
+        worst = 0
+        for _ in range(20):   # context is randomly chosen — check the worst case
+            ctx = (random.choice(secs) if secs else '')[:1200]
+            user = f"Here is the source code:\n\n```python\n{ctx}\n```"
+            combined = f"{nanoagi.SELF_CODE_PROMPT}\n\n{user}"
+            worst = max(worst, len(combined.encode('utf-8')))
+        self.assertLessEqual(worst, 2048, f"combined prompt {worst}B exceeds DoE buffer")
+
+    def test_chuck_train_no_notorch(self):
+        import io
+        from contextlib import redirect_stdout
+        karl = make_karl(merges=32)
+        _meta, ids = make_meta(karl)
+        model = make_model(karl)
+        orig = nanoagi.NOTORCH_AVAILABLE
+        nanoagi.NOTORCH_AVAILABLE = False
+        f = io.StringIO()
+        try:
+            with redirect_stdout(f):
+                r = nanoagi.chuck_train(karl, ids, model, steps=3)
+        finally:
+            nanoagi.NOTORCH_AVAILABLE = orig
+        self.assertIsNone(r)
+        self.assertIn("Can't train", f.getvalue())
+
+    @unittest.skipUnless(getattr(nanoagi, 'NOTORCH_AVAILABLE', False), "notorch not available")
+    def test_arch_validation_loud(self):
+        from ariannamethod.notorch_nn import NotorchNanoAGI
+        with self.assertRaises(ValueError):   # n_content + n_rrpram != n_head
+            NotorchNanoAGI(256, n_embd=384, n_head=6, n_layer=1, ctx=16,
+                           n_content=2, n_rrpram=2)
+        with self.assertRaises(ValueError):   # n_embd % n_head != 0
+            NotorchNanoAGI(256, n_embd=64, n_head=3, n_layer=1, ctx=16,
+                           n_content=2, n_rrpram=1)
+
+    def test_repl_autoself_and_quit(self):
+        import io, builtins
+        from contextlib import redirect_stdout
+        karl = make_karl(merges=32)
+        meta, _ids = make_meta(karl)
+        model = make_model(karl)
+        inputs = iter(['autoself on', 'autoself off', 'quit'])
+        saved = builtins.input
+        builtins.input = lambda *a: next(inputs)
+        f = io.StringIO()
+        try:
+            with redirect_stdout(f):
+                nanoagi.repl(karl, meta, model)
+        finally:
+            builtins.input = saved
+        out = f.getvalue()
+        self.assertIn('ON', out)
+        self.assertIn('OFF', out)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # main
 # ─────────────────────────────────────────────────────────────────────────────
