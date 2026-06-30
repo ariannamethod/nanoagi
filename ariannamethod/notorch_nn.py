@@ -401,20 +401,18 @@ class NotorchEngine:
                 seen.add(p._ptr)
                 self.params.append(p)
 
-    def step(self, token_ids, target_ids, update=True):
-        """One training step. Returns loss float.
+    def _forward(self, token_ids):
+        """Build the forward graph on a FRESH tape; return the logits tape index.
 
-        update=False makes it forward-only (loss measurement without a weight
-        update) — used to score validation without training on the val set.
+        Shared by step() (train: + cross_entropy + backward) and forward_logits()
+        (generate: read last-position logits). One forward definition means the
+        train-forward and the generation-forward can never drift apart.
         """
         m = self.model
         T = len(token_ids)
-        ctx = m.ctx
         dim = m.n_embd
         hd = m.hd
-        nc = m.n_content
         nr = m.n_rrpram
-        V = m.vocab_size
 
         _lib.nt_tape_start()
 
@@ -424,19 +422,15 @@ class NotorchEngine:
             idx = _lib.nt_tape_param(p._ptr)
             tape_ids.append(idx)
 
-        # Token/target tensors
+        # Token tensor (the target lives in step() — the forward needs only inputs)
         tok_t = Tensor.zeros(T)
-        tgt_t = Tensor.zeros(T)
         tok_t.set_data([float(x) for x in token_ids])
-        tgt_t.set_data([float(x) for x in target_ids])
         tok_idx = _lib.nt_tape_record(tok_t._ptr, 0, -1, -1, ctypes.c_float(0))
-        tgt_idx = _lib.nt_tape_record(tgt_t._ptr, 0, -1, -1, ctypes.c_float(0))
         tok_t._owns = False
-        tgt_t._owns = False
 
         # Parameter order: wte, then per block:
-        #   norm1, wq, wk, wv_content, wr, wv_rrpram, wo, norm2, gate, up, down
-        # then norm_f, lm_head (but lm_head is tied to wte)
+        #   wr, norm1, wq, wk, wv_content, wv_rrpram, wo, norm2, gate, up, down
+        # then norm_f (lm_head is tied to wte → reuses wte_i)
         pi = 0
         wte_i = tape_ids[pi]; pi += 1
 
@@ -489,7 +483,27 @@ class NotorchEngine:
         # lm_head weight is tied to wte — reuse wte_i for output projection
         hf = _lib.nt_seq_rmsnorm(h, rmsf_i, T, dim)
         logits = _lib.nt_seq_linear(wte_i, hf, T)
-        # Note: lm_head.weight was deduplicated out of params (same ptr as wte.weight)
+        return logits
+
+    def step(self, token_ids, target_ids, update=True):
+        """One training step. Returns loss float.
+
+        update=False makes it forward-only (loss measurement without a weight
+        update) — used to score validation without training on the val set.
+        """
+        m = self.model
+        T = len(token_ids)
+        V = m.vocab_size
+
+        # Forward (shared with forward_logits — train-forward == gen-forward)
+        logits = self._forward(token_ids)
+
+        # Target tensor + cross-entropy
+        tgt_t = Tensor.zeros(T)
+        tgt_t.set_data([float(x) for x in target_ids])
+        tgt_idx = _lib.nt_tape_record(tgt_t._ptr, 0, -1, -1, ctypes.c_float(0))
+        tgt_t._owns = False
+        # lm_head.weight is deduplicated out of params (same ptr as wte.weight)
         loss_idx = _lib.nt_seq_cross_entropy(logits, tgt_idx, T, V)
 
         # Read loss value
@@ -514,6 +528,26 @@ class NotorchEngine:
         _lib.nt_tape_clear()
 
         return loss_val
+
+    def forward_logits(self, token_ids):
+        """Last-position logits from the current (trained) weights — for generation.
+
+        Forward-only via the shared _forward, then read the logits row of the final
+        position ([(T-1)*V : T*V], row-major per notorch.c nt_seq_linear) and clear
+        the tape. No target, no backward: this is the flesh voice that grows louder
+        as Chuck trains the weights — the trained artifact that actually speaks.
+        """
+        m = self.model
+        T = len(token_ids)
+        V = m.vocab_size
+        logits_idx = self._forward(token_ids)
+        tape_ptr = _lib.nt_tape_get()
+        out_ptr = ctypes.cast(tape_ptr, ctypes.POINTER(_NtTapeEntry))[logits_idx].output
+        lts = ctypes.cast(out_ptr, ctypes.POINTER(_NtTensor)).contents
+        base = (T - 1) * V
+        row = [lts.data[base + j] for j in range(V)]
+        _lib.nt_tape_clear()
+        return row
 
     def save(self, path):
         n = len(self.params)

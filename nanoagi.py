@@ -765,6 +765,86 @@ class NanoAGI:
         logits = linear(x, self.lm_head)
         return logits
 
+    def _field_sample(self, raw_logits, context, last_tid, meta, temperature):
+        """Dario field overlay + repetition penalty + top-k/temperature sampling.
+
+        Backend-agnostic: operates on float logits, so the SAME ghost field and the
+        SAME sampling serve both the Python flesh (generate) and the notorch flesh
+        (generate_notorch). Only the source of raw_logits differs — the voice handoff
+        (ghost → trained flesh) lives entirely in those input logits. Mutates
+        self.destiny / self.trauma. Returns the chosen token id.
+        """
+        # ── Dario Field: ghost overlay on flesh ──
+        if meta is not None:
+            hebbian = meta.query_hebbian(context[-8:], self.vocab_size)
+            prophecy = meta.query_prophecy(context[-8:], self.vocab_size)
+            bigram = meta.query_bigram(last_tid, self.vocab_size)
+            trigram = (meta.query_trigram(context[-2], context[-1], self.vocab_size)
+                       if len(context) >= 2 else [0.0] * self.vocab_size)
+
+            # Destiny update
+            if last_tid < len(self.wte):
+                for d in range(self.n_embd):
+                    self.destiny[d] = 0.9 * self.destiny[d] + 0.1 * self.wte[last_tid][d].data
+
+            # Destiny signal: cosine similarity with each token embedding
+            destiny_signal = [0.0] * self.vocab_size
+            dest_norm = math.sqrt(sum(d * d for d in self.destiny) + 1e-10)
+            if dest_norm > 1e-8:
+                for tid_c in range(min(self.vocab_size, len(self.wte))):
+                    emb = [self.wte[tid_c][d].data for d in range(self.n_embd)]
+                    emb_norm = math.sqrt(sum(e * e for e in emb) + 1e-10)
+                    if emb_norm > 1e-8:
+                        dot = sum(self.destiny[d] * emb[d] for d in range(self.n_embd))
+                        destiny_signal[tid_c] = dot / (dest_norm * emb_norm)
+
+            # Dario Equation: p(x|Φ) = softmax((B + α·H + β·F + γ·A + T) / τ)
+            for i in range(self.vocab_size):
+                raw_logits[i] += (self.alpha_hebbian * hebbian[i]
+                                  + self.beta_prophecy * prophecy[i]
+                                  + self.gamma_destiny * destiny_signal[i]
+                                  + 12.0 * bigram[i]
+                                  + 8.0 * trigram[i])
+
+            # Trauma modulates the field through temperature (Dario: T lives inside /τ),
+            # applied at the scaling step below — negative-safe, unlike a raw-logit multiply
+            # (which boosts negative logits toward zero).
+
+        # Repetition penalty (Leo-style)
+        recent = context[-12:] if len(context) >= 12 else context
+        for t in recent:
+            if t < self.vocab_size:
+                raw_logits[t] -= 4.0   # subtractive penalty — negative-safe (a *0.5 boosts negative logits toward 0)
+
+        # Top-k + temperature + softmax
+        top_k = 15
+        indexed = sorted(enumerate(raw_logits), key=lambda x: -x[1])
+        threshold = indexed[min(top_k - 1, len(indexed) - 1)][1]
+        for i in range(self.vocab_size):
+            if raw_logits[i] < threshold:
+                raw_logits[i] = -1e10
+
+        eff_temp = temperature * (1.0 + self.trauma)   # trauma heats the field (Dario T/τ), negative-safe
+        scaled = [l / eff_temp for l in raw_logits]
+        probs = softmax_float(scaled)
+
+        # Sample
+        r = random.random()
+        cum = 0.0
+        chosen = 0
+        for i, p in enumerate(probs):
+            cum += p
+            if cum > r:
+                chosen = i
+                break
+
+        # Trauma accumulates from surprising (below-uniform-probability) tokens.
+        # README: "self.trauma += 0.1 every time a surprising token appears."
+        if probs[chosen] < 1.0 / self.vocab_size:
+            self.trauma += 0.1
+
+        return chosen
+
     def generate(self, prompt_ids, max_tokens=80, meta=None, temperature=None):
         """
         Generate tokens with the real transformer + Dario field overlay.
@@ -792,80 +872,44 @@ class NanoAGI:
             last_tid = context[-1]
             logits = self.forward_token(last_tid, pos, kv_cache)
 
-            # Extract raw logit values from Val objects
+            # Flesh logits from the Python transformer (Val objects → floats); the
+            # ghost field overlay + sampling are shared with the notorch path.
             raw_logits = [l.data for l in logits]
-
-            # ── Dario Field: ghost overlay on flesh ──
-            if meta is not None:
-                hebbian = meta.query_hebbian(context[-8:], self.vocab_size)
-                prophecy = meta.query_prophecy(context[-8:], self.vocab_size)
-                bigram = meta.query_bigram(last_tid, self.vocab_size)
-                trigram = (meta.query_trigram(context[-2], context[-1], self.vocab_size)
-                           if len(context) >= 2 else [0.0] * self.vocab_size)
-
-                # Destiny update
-                if last_tid < len(self.wte):
-                    for d in range(self.n_embd):
-                        self.destiny[d] = 0.9 * self.destiny[d] + 0.1 * self.wte[last_tid][d].data
-
-                # Destiny signal: cosine similarity with each token embedding
-                destiny_signal = [0.0] * self.vocab_size
-                dest_norm = math.sqrt(sum(d * d for d in self.destiny) + 1e-10)
-                if dest_norm > 1e-8:
-                    for tid_c in range(min(self.vocab_size, len(self.wte))):
-                        emb = [self.wte[tid_c][d].data for d in range(self.n_embd)]
-                        emb_norm = math.sqrt(sum(e * e for e in emb) + 1e-10)
-                        if emb_norm > 1e-8:
-                            dot = sum(self.destiny[d] * emb[d] for d in range(self.n_embd))
-                            destiny_signal[tid_c] = dot / (dest_norm * emb_norm)
-
-                # Dario Equation: p(x|Φ) = softmax((B + α·H + β·F + γ·A + T) / τ)
-                for i in range(self.vocab_size):
-                    raw_logits[i] += (self.alpha_hebbian * hebbian[i]
-                                      + self.beta_prophecy * prophecy[i]
-                                      + self.gamma_destiny * destiny_signal[i]
-                                      + 12.0 * bigram[i]
-                                      + 8.0 * trigram[i])
-
-                # Trauma modulates the field through temperature (Dario: T lives inside /τ),
-                # applied at the scaling step below — negative-safe, unlike a raw-logit multiply
-                # (which boosts negative logits toward zero).
-
-            # Repetition penalty (Leo-style)
-            recent = context[-12:] if len(context) >= 12 else context
-            for t in recent:
-                if t < self.vocab_size:
-                    raw_logits[t] -= 4.0   # subtractive penalty — negative-safe (a *0.5 boosts negative logits toward 0)
-
-            # Top-k + temperature + softmax
-            top_k = 15
-            indexed = sorted(enumerate(raw_logits), key=lambda x: -x[1])
-            threshold = indexed[min(top_k - 1, len(indexed) - 1)][1]
-            for i in range(self.vocab_size):
-                if raw_logits[i] < threshold:
-                    raw_logits[i] = -1e10
-
-            eff_temp = temperature * (1.0 + self.trauma)   # trauma heats the field (Dario T/τ), negative-safe
-            scaled = [l / eff_temp for l in raw_logits]
-            probs = softmax_float(scaled)
-
-            # Sample
-            r = random.random()
-            cum = 0.0
-            chosen = 0
-            for i, p in enumerate(probs):
-                cum += p
-                if cum > r:
-                    chosen = i
-                    break
+            chosen = self._field_sample(raw_logits, context, last_tid, meta, temperature)
 
             generated.append(chosen)
             context.append(chosen)
 
-            # Trauma accumulates from surprising (below-uniform-probability) tokens.
-            # README: "self.trauma += 0.1 every time a surprising token appears."
-            if probs[chosen] < 1.0 / self.vocab_size:
-                self.trauma += 0.1
+        return generated
+
+    def generate_notorch(self, engine, prompt_ids, max_tokens=80, meta=None, temperature=None):
+        """Generate from the TRAINED notorch weights (flesh) + Dario field (ghost).
+
+        The missing half of the ghost→flesh handoff: chuck_train trains a
+        NotorchNanoAGI to karl_chuck.nt, and THIS path makes those trained weights
+        actually speak. notorch flesh logits (engine.forward_logits) replace the
+        Python flesh; _field_sample applies the identical ghost overlay + sampling.
+        As Chuck trains the weights the flesh logits grow and take the voice from
+        the ghost — the dynamic handoff, not a static seed.
+
+        No KV cache: notorch rebuilds the full forward each step over the last `ctx`
+        tokens (cheap at nano scale, exact). vocab must match the Python model so
+        _field_sample's meta queries line up — the caller guarantees this.
+        """
+        if temperature is None:
+            temperature = self.temperature
+
+        ctx = engine.model.ctx
+        generated = list(prompt_ids)
+        context = list(prompt_ids) if prompt_ids else [0]
+
+        for step in range(max_tokens):
+            window = context[-ctx:]
+            raw_logits = engine.forward_logits(window)   # trained flesh
+            last_tid = context[-1]
+            chosen = self._field_sample(raw_logits, context, last_tid, meta, temperature)
+            generated.append(chosen)
+            context.append(chosen)
 
         return generated
 
@@ -2177,13 +2221,53 @@ def chuck_train(karl, token_ids, model, steps=200, meta=None, ckpt_path='karl_ch
         return None
 
 
+def _get_notorch_engine(model, ckpt_path='karl_chuck.nt'):
+    """Restore (and cache on the model) the notorch engine from Chuck's trained
+    checkpoint, so generation speaks with the trained flesh — not the orphan
+    weights that used to sit unused on disk. The engine STRUCTURE is built once and
+    cached; the weights are re-loaded every call so warm-training advances are
+    always picked up. Returns None when notorch is absent or the checkpoint is
+    missing / vocab-mismatched (KARL's BPE grows) → caller falls back to Python flesh.
+    """
+    if not NOTORCH_AVAILABLE:
+        return None
+    vguard = ckpt_path + '.vocab'
+    if not (os.path.exists(ckpt_path) and os.path.exists(vguard)):
+        return None
+    try:
+        saved_vocab = int(open(vguard).read().strip())
+    except Exception:
+        return None
+    if saved_vocab != model.vocab_size:
+        model._nt_engine = None   # vocab grew → cached engine is the wrong shape
+        return None
+    eng = getattr(model, '_nt_engine', None)
+    if eng is None or getattr(model, '_nt_engine_vocab', None) != model.vocab_size:
+        nt_model = NotorchNanoAGI(model.vocab_size, n_embd=model.n_embd,
+                                  n_head=model.n_head, n_layer=model.n_layer,
+                                  ctx=model.context_len, n_content=model.n_content,
+                                  n_rrpram=model.n_rrpram)
+        eng = NotorchEngine(nt_model)
+        model._nt_engine = eng
+        model._nt_engine_vocab = model.vocab_size
+    if not eng.load(ckpt_path):    # always reload the latest trained weights
+        return None
+    return eng
+
+
 def continue_phrase(prompt, karl, meta, model, max_tokens=80, temperature=0.75):
-    """Generate continuation of a prompt. Ghost + flesh together."""
+    """Generate continuation of a prompt. Trained notorch flesh + ghost field when
+    Chuck has trained weights on disk; pure-Python flesh + ghost otherwise."""
     prompt_ids = karl.encode(prompt)
     if not prompt_ids:
         return prompt
-    generated = model.generate(prompt_ids, max_tokens=max_tokens,
-                                meta=meta, temperature=temperature)
+    engine = _get_notorch_engine(model)
+    if engine is not None:
+        generated = model.generate_notorch(engine, prompt_ids, max_tokens=max_tokens,
+                                           meta=meta, temperature=temperature)
+    else:
+        generated = model.generate(prompt_ids, max_tokens=max_tokens,
+                                    meta=meta, temperature=temperature)
     return karl.decode(generated)
 
 
