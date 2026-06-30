@@ -3,6 +3,10 @@ chuck.mem
 results.tsv
 karl_chuck.nt
 karl_chuck.nt.vocab
+karl_chuck.nt.manifest
+karl_chuck_supermilestone.nt
+karl_chuck_supermilestone.nt.manifest
+nanoagi_supermilestone_paperlog.md
 __pycache__/
 *.pyc
 ariannamethod/libnotorch.dylib
