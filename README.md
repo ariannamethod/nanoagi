@@ -331,10 +331,11 @@ MUTATION_SPACE = {
     'context_len':  [32, 48, 64, 96, 128],
     'lr':           [1e-4, 2e-4, 3e-4, 5e-4, 1e-3],
     'weight_decay': [0.0, 0.001, 0.01, 0.05, 0.1],
-    'beta1':        [0.85, 0.9, 0.95],
-    'beta2':        [0.95, 0.98, 0.999],
 }
 ```
+
+(Chuck manages its own momentum internally in notorch C, so beta1/beta2 are not evolved
+genes — `nt_tape_chuck_step(lr, loss)` takes no betas.)
 
 Constraints enforced automatically: `n_embd % n_head == 0`, `n_content + n_rrpram == n_head`.
 
@@ -354,12 +355,10 @@ karl> evolve 20
 Baseline: Genome(embd=64, head=4, layer=3, ctx=64, lr=0.0003, wd=0.01)
 val_bpb = 8.4094
 
-Improvements found:
-  beta1=0.85     →  8.0881  (-3.8%)
+Improvements found (historical H100 run; beta genes since removed — Chuck owns momentum):
   n_head=2       →  8.0545  (-0.4%)
   lr=5e-4        →  7.8039  (-3.1%)
   weight_decay=0 →  7.7644  (-0.1%)
-  beta1=0.95     →  7.7581  (-0.1%)
   n_embd=96      →  7.7550  (-0.04%)
 
 Best: Genome(embd=96, head=2, layer=3, ctx=64, lr=0.0005, wd=0.0)
@@ -414,8 +413,8 @@ When `self_code` needs an LLM, it doesn't ask you for an API key. It scans the e
 ```
   1. Ollama (localhost:11434)     → check /api/tags, prefer coder models
   2. llama.cpp server (:8080)    → check /health
-  3. Local GGUF + llama-cli      → scan ~/Downloads, ~/.cache, ~/models for *.gguf
-  4. HuggingFace Inference API   → if HF_TOKEN is set
+  3. Local coder GGUF + llama-cli → scan ~/Downloads, ~/.cache, ~/models for *coder*.gguf
+  4. Download a coder GGUF directly from HF → no token, verified by pinned sha256, run via llama-cli
   5. Blind mutation               → random targeted AST changes, test, keep or revert
 ```
 
@@ -501,7 +500,7 @@ Configurable: `stagnation_threshold=10`, `auto_self_code=True`. No API key requi
 
 ## swarm — release the hyenas
 
-Not full copies of itself — mini-agents. Hyenas. Each gets a unique random seed, explores a different part of the genome space **in parallel**. The pack shares findings. The best result wins.
+Not full copies of itself — mini-agents. Hyenas. Each gets a unique random seed, explores a different part of the genome space. The pack shares findings. The best result wins. They run **one after another** — notorch's training tape is a single global, so concurrent training steps would corrupt it; the parallelism is in the seeds explored, not in wall-clock.
 
 ```bash
 # CLI: 4 hyenas (default)
@@ -534,7 +533,7 @@ karl> swarm 6
 ============================================================
 ```
 
-Each hyena is a Python thread. notorch runs in C (no GIL), so there IS real parallelism. Karpathy dreams of "swarm of agents emulating a research community." We built it. We called them hyenas. Because hyenas hunt in packs.
+Each hyena runs in turn. notorch's training tape is a single global, so running steps concurrently would race and corrupt it — the pack explores sequentially, each hyena with its own seed and its own region of genome space. Karpathy dreams of "swarm of agents emulating a research community." We built it. We called them hyenas. Because hyenas hunt in packs.
 
 ### the levels of autonomy
 
@@ -546,9 +545,9 @@ Each hyena is a Python thread. notorch runs in C (no GIL), so there IS real para
 | 3 | `coevolve` | **Data and architecture evolve together** |
 | 4 | `selfcode` | **Scan environment for ANY LLM, read own source, apply patch** |
 | 4+ | *(automatic)* | **Stagnation in evolve triggers selfcode autonomously** (horizontal gene transfer) |
-| 5 | `swarm` | **Release hyenas** — parallel genome exploration, pack shares findings |
+| 5 | `swarm` | **Release hyenas** — sequential genome exploration, pack shares findings |
 
-Level 0 is a transformer. Level 1 is a transformer that feeds itself. Level 2 is a transformer that redesigns itself. Level 3 is a transformer that redesigns itself while choosing its own training data. Level 4 is a transformer that scans its filesystem for GGUFs, checks if Ollama is running, tries llama.cpp, falls back to HuggingFace, and if absolutely nothing exists, mutates itself blind — then asks that LLM to rewrite its source code. Level 4+ is a transformer that *decides for itself* when to ask. Level 5 is a pack of transformers doing all of the above in parallel.
+Level 0 is a transformer. Level 1 is a transformer that feeds itself. Level 2 is a transformer that redesigns itself. Level 3 is a transformer that redesigns itself while choosing its own training data. Level 4 is a transformer that scans its filesystem for coder GGUFs, checks if Ollama is running, tries llama.cpp, downloads a coder GGUF directly from HuggingFace (no token), and if absolutely nothing exists, mutates itself blind — then asks that LLM to rewrite its source code. Level 4+ is a transformer that *decides for itself* when to ask. Level 5 is a pack of transformers doing all of the above in sequence (one shared global training tape).
 
 At no level does it ask for permission. At no level does it require an API key.
 
@@ -602,7 +601,7 @@ Chuck is not just an optimizer. Chuck is a port of the battle-tested [chuck.py](
 
 Chuck persists memories to `chuck.mem` (binary, C-compatible with lee.c). Chuck records regime changes. Chuck recalls similar training states from memory and adjusts behavior. Chuck freezes layers when their gradients flatline.
 
-If `chuck.py` is not present, nanoagi falls back to a simplified Chuck (basic AdamW + trend dampen). But the real Chuck is included in this repo. The real Chuck has been through Janus 285M, Yent 55M, and 8 BPE model retrains. The real Chuck has seen things.
+Chuck lives in notorch C (`nt_tape_chuck_step`) — there is no Python fallback; if notorch can't load, Karl works alone in pure-metaweight mode (no Chuck, no training). The real Chuck has been through Janus 285M, Yent 55M, and 8 BPE model retrains. The real Chuck has seen things.
 
 Chuck wakes up at startup if notorch is present. Chuck trains 200 steps. Chuck prints progress every 50 steps. Chuck says "Karl, your weights are warm now." when done. Chuck goes to sleep. Chuck wakes up again after the next retokenization. This is Chuck's entire life. Chuck has found meaning in it.
 
@@ -793,8 +792,8 @@ A: Recursive Resonant Pattern Recognition Attention Mechanism. The acronym took 
 **Q: Why autoresearch?**
 A: Because Andrej Karpathy built autoresearch to have an agent find papers for a model, and the obvious next step was to make the tokenizer the agent. Karl is the agent. Karl hunts for text the way other agents hunt for papers. Karl is less sophisticated. Karl does not distinguish between a scientific paper and a README. Karl eats both. Karl is not judging the source. Karl is hungry.
 
-**Q: What does "autoresearch_url" default to if no URL is given?**
-A: It picks randomly from: the nanoGPT README and the PostGPT README. KARL knows its family and eats from the family table first.
+**Q: How does nanoagi eat from a URL?**
+A: `fetch <url>` in the REPL downloads that URL's text and feeds it to KARL (ingest + SHA256 dedup). You give the URL — KARL eats it. For autonomous data hunting without a URL, `feed` pulls fresh batches from climbmix.
 
 **Q: Will nanoagi ever become actually AGI?**
 A: The corpus grows. The vocabulary expands. The metaweights shift. The weights get warmer. The greetings stay the same. What is AGI? A Chinese Room with better BPE merges? A corpus large enough that the statistics approximate understanding? The feeling you get at 4am when the loss curve bends and you whisper "hello?" and something coherent whispers back? I don't know. Karl doesn't know. But there's a line in the code that says "Hello, I am a helpful AGI. At least I try." and that line might be the most honest sentence in this repository.

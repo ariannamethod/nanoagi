@@ -42,7 +42,10 @@ try:
     )
     NOTORCH_AVAILABLE = True
     TORCH_AVAILABLE = True  # compat alias — all code now uses NOTORCH_AVAILABLE
-except ImportError:
+except Exception:
+    # Not just ImportError: notorch_nn compiles libnotorch on import and can raise
+    # OSError (CDLL load) / RuntimeError (compile failed). Any failure → Karl works
+    # alone in pure-metaweight mode, as the README promises ("No notorch, Karl alone").
     pass
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1235,8 +1238,8 @@ class Genome:
         'context_len':  [32, 48, 64, 96, 128],
         'lr':           [1e-4, 2e-4, 3e-4, 5e-4, 1e-3],
         'weight_decay': [0.0, 0.001, 0.01, 0.05, 0.1],
-        'beta1':        [0.85, 0.9, 0.95],
-        'beta2':        [0.95, 0.98, 0.999],
+        # beta1/beta2 dropped: canon Chuck (nt_tape_chuck_step(lr, loss)) manages its own
+        # momentum internally — evolving betas had no effect (they never reached the C step).
     }
 
     def __init__(self):
@@ -1244,7 +1247,6 @@ class Genome:
             'n_embd': 64, 'n_head': 4, 'n_layer': 3,
             'n_content': 2, 'n_rrpram': 2, 'context_len': 64,
             'lr': 3e-4, 'weight_decay': 0.01,
-            'beta1': 0.9, 'beta2': 0.999,
         }
 
     def mutate(self):
@@ -1311,8 +1313,7 @@ def _evaluate_genome(karl, token_ids, genome, train_seconds=30, device=None):
         n_embd=g['n_embd'], n_head=g['n_head'], n_layer=g['n_layer'],
         ctx=ctx, n_content=g['n_content'], n_rrpram=g['n_rrpram'],
     )
-    engine = NotorchEngine(tmodel, lr=g['lr'], weight_decay=g['weight_decay'],
-                           beta1=g['beta1'], beta2=g['beta2'])
+    engine = NotorchEngine(tmodel, lr=g['lr'], weight_decay=g['weight_decay'])
     n_params = sum(p.numel for p in engine.params)  # deduped (tied wte/lm_head once)
 
     # Train for fixed wall-clock time
@@ -1765,117 +1766,256 @@ def _blind_mutate(karl, karl_txt_path):
     return None
 
 
+# Coder GGUF whitelist — only these may be downloaded directly. Every entry carries a
+# MANDATORY pinned sha256 (the HF git-LFS oid); a hash mismatch is a hard failure, never
+# used. No hosted API, no token: the organism fetches its own brain like water.
+_CODER_GGUF_WHITELIST = {
+    '1.5b': ('Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF', 'qwen2.5-coder-1.5b-instruct-q4_k_m.gguf',
+             1117320768, 'cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046'),
+    '3b':   ('Qwen/Qwen2.5-Coder-3B-Instruct-GGUF', 'qwen2.5-coder-3b-instruct-q4_k_m.gguf',
+             2104932800, '724fb256bec1ff062b2f65e4569e871ad2e95ab2a3989723d1769c54294730b7'),
+    '7b':   ('Qwen/Qwen2.5-Coder-7B-Instruct-GGUF', 'qwen2.5-coder-7b-instruct-q4_k_m.gguf',
+             4683073536, '509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c'),
+}
+
+
+def _is_coder_name(name):
+    n = (name or '').lower()
+    return 'coder' in n or 'code' in n
+
+
+def _find_doe_binary():
+    """Find a DoE binary — our own generic-GGUF inference engine (reads arch + tokenizer
+    from GGUF metadata, knows Qwen). NOT llama.cpp (banned): GGUFs run through DoE."""
+    import subprocess
+    for name in ['doe_field', 'doe']:
+        try:
+            r = subprocess.run(['which', name], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            pass
+    for p in [os.path.expanduser('~/arianna/doe/doe_field'),
+              os.path.expanduser('~/arianna-shared/yent-inference/DoE/doe_field'),
+              os.path.expanduser('~/arianna/doe/doe'),
+              '/usr/local/bin/doe_field', '/usr/local/bin/doe']:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _doe_serve_start(binary, gguf_path, port=8779, ready_timeout=90):
+    """Start DoE as a local OpenAI-compatible server on the coder GGUF and wait until it
+    answers. Returns the subprocess handle, or None on failure (caller falls back).
+    self_code stops it when done."""
+    import subprocess, time as _t
+    from urllib.request import urlopen
+    try:
+        proc = subprocess.Popen(
+            [binary, '--model', gguf_path, '--serve', str(port),
+             '--max-new', '256', '--no-save-spore', '--no-load-spore'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"  [ENV] DoE serve failed to start: {e}")
+        return None
+    url = f"http://127.0.0.1:{port}/"
+    t0 = _t.time()
+    while _t.time() - t0 < ready_timeout:
+        if proc.poll() is not None:
+            print(f"  [ENV] DoE serve exited early (code {proc.returncode})")
+            return None
+        try:
+            urlopen(url, timeout=2).read()
+            return proc                      # health endpoint answered → ready
+        except Exception:
+            _t.sleep(2)
+    print(f"  [ENV] DoE serve not ready in {ready_timeout}s")
+    try: proc.terminate()
+    except Exception: pass
+    return None
+
+
+def _stop_llm(llm):
+    """Stop a DoE server started by _find_llm (no-op for ollama/llamacpp/none)."""
+    proc = (llm or {}).get('proc')
+    if proc is not None:
+        try:
+            proc.terminate(); proc.wait(timeout=5)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+
+
+def _scan_local_ggufs():
+    import glob
+    paths = []
+    for d in ['.', os.path.expanduser('~/.cache'), os.path.expanduser('~/Downloads'),
+              os.path.expanduser('~/models'), os.path.expanduser('~/.local/share/llama.cpp'),
+              '/tmp']:
+        paths.extend(glob.glob(os.path.join(d, '**', '*.gguf'), recursive=True))
+        if len(paths) > 50:
+            break
+    return paths
+
+
+def _download_coder_gguf(dest_dir, key=None):
+    """Download a whitelisted coder GGUF DIRECTLY from HuggingFace — no API, no token.
+
+    Streams to a .part file, verifies Content-Length and the MANDATORY pinned sha256,
+    then atomically renames into place. A hash mismatch or any transport failure (timeout,
+    non-2xx, ENOSPC, interrupted) cleans up and returns None — never a corrupt/unverified
+    file. Returns the local path or None.
+    """
+    import ssl, hashlib
+    from urllib.request import urlopen, Request
+    key = (key or os.environ.get('NANO_CODER_GGUF', '3b')).lower()
+    if key not in _CODER_GGUF_WHITELIST:
+        print(f"  [ENV] coder key '{key}' not whitelisted ({list(_CODER_GGUF_WHITELIST)})")
+        return None
+    repo, fname, size, sha = _CODER_GGUF_WHITELIST[key]
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except Exception as e:
+        print(f"  [ENV] cannot create {dest_dir}: {e}")
+        return None
+    dest = os.path.join(dest_dir, fname)
+    part = dest + '.part'
+    # already present + integrity-verified?
+    if os.path.exists(dest) and os.path.getsize(dest) == size:
+        return dest
+    if os.path.exists(part):
+        try: os.remove(part)   # stale partial — start clean
+        except Exception: pass
+    url = f"https://huggingface.co/{repo}/resolve/main/{fname}?download=true"
+    print(f"  [ENV] Downloading coder GGUF directly (no token): {repo}/{fname} ({size/1e6:.0f}MB)")
+    try:
+        ctx = ssl.create_default_context()
+        req = Request(url, headers={'User-Agent': 'nanoagi/1.0 (self-code)'})
+        h = hashlib.sha256(); got = 0
+        with urlopen(req, timeout=60, context=ctx) as r, open(part, 'wb') as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk); h.update(chunk); got += len(chunk)
+    except Exception as e:
+        print(f"  [ENV] download failed: {e}")
+        try: os.remove(part)
+        except Exception: pass
+        return None
+    if got != size:
+        print(f"  [ENV] size mismatch ({got} != {size}); discarding")
+        try: os.remove(part)
+        except Exception: pass
+        return None
+    if h.hexdigest() != sha:
+        print(f"  [ENV] sha256 mismatch; discarding (refuse unverified coder)")
+        try: os.remove(part)
+        except Exception: pass
+        return None
+    try:
+        os.replace(part, dest)
+    except Exception as e:
+        print(f"  [ENV] finalize failed: {e}")
+        try: os.remove(part)
+        except Exception: pass
+        return None
+    print(f"  [ENV] coder GGUF verified + saved -> {dest}")
+    return dest
+
+
 def _find_llm():
     """
-    Scan the environment for any available LLM. Try everything. Die last.
+    Find an LLM for self-code. Global coder-preference: no generic/unidentified backend
+    ever precedes a real coder we can obtain. Direct GGUF download — never a hosted API.
 
-    Returns dict: {'type': 'ollama'|'llamacpp'|'gguf'|'hf'|None,
-                   'url': ..., 'model': ..., 'token': ..., 'gguf_path': ..., 'binary': ...}
+    Returns dict: {'type': 'ollama'|'llamacpp'|'gguf'|None,
+                   'url': ..., 'model': ..., 'gguf_path': ..., 'binary': ...}
 
-    Search order:
-      1. Ollama (localhost:11434) — check /api/tags for models
-      2. llama.cpp server (localhost:8080) — check /health
-      3. Local GGUF + llama-cli binary — scan disk, run inference directly
-      4. HuggingFace Inference API — needs HF_TOKEN
-      5. None — you're on your own. mutate blind.
+    Order (coder-first; GGUFs run through DoE — our engine, never llama.cpp):
+      1. Ollama with a coder model
+      2. llama.cpp server, only if its loaded model identifies as a coder
+      3. local coder GGUF (filename has 'coder') → served by DoE
+      4. download a whitelisted coder GGUF directly from HF → served by DoE
+      5. last-resort generic: any Ollama model / llama.cpp server / generic GGUF via DoE
+      6. nothing — blind mutation
     """
     from urllib.request import urlopen, Request
     import json as _json
 
     env = {'type': None, 'url': None, 'model': None, 'token': None,
-           'gguf_path': None, 'binary': None}
+           'gguf_path': None, 'binary': None, 'proc': None}
+    OLL = 'http://localhost:11434/v1/chat/completions'
+    LCP = 'http://localhost:8080/v1/chat/completions'
+    DOE_PORT = 8779
 
-    # 1. Ollama
+    # gather availability
+    ollama_models = []
     try:
         r = urlopen('http://localhost:11434/api/tags', timeout=3)
-        data = _json.loads(r.read())
-        models = [m['name'] for m in data.get('models', [])]
-        if models:
-            # prefer coder models, then biggest
-            coder = [m for m in models if 'coder' in m.lower() or 'code' in m.lower()]
-            pick = coder[0] if coder else models[0]
-            env.update(type='ollama', url='http://localhost:11434/v1/chat/completions',
-                       model=pick)
-            print(f"  [ENV] Ollama found: {len(models)} models, picked {pick}")
-            return env
+        ollama_models = [m['name'] for m in _json.loads(r.read()).get('models', [])]
     except Exception:
         pass
-
-    # 2. llama.cpp server
+    llamacpp_up, llamacpp_model = False, None
     try:
         r = urlopen('http://localhost:8080/health', timeout=3)
         if r.status == 200:
-            env.update(type='llamacpp', url='http://localhost:8080/v1/chat/completions',
-                       model='local')
-            print(f"  [ENV] llama.cpp server found at :8080")
-            return env
+            llamacpp_up = True
+            try:
+                rm = urlopen('http://localhost:8080/v1/models', timeout=3)
+                llamacpp_model = (_json.loads(rm.read()).get('data') or [{}])[0].get('id')
+            except Exception:
+                llamacpp_model = None
     except Exception:
         pass
+    doe = _find_doe_binary()
+    local_ggufs = _scan_local_ggufs() if doe else []
+    local_coders = [p for p in local_ggufs if 'coder' in os.path.basename(p).lower()]
 
-    # 3. Local GGUF + binary — scan like DoE does
-    import subprocess, glob
-    # find llama-cli or llama-server binary
-    binary = None
-    for name in ['llama-cli', 'llama-server', 'main', 'llama.cpp/main',
-                 'llama.cpp/build/bin/llama-cli']:
-        try:
-            r = subprocess.run(['which', name], capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
-                binary = r.stdout.strip()
-                break
-        except Exception:
-            pass
-    # also check common install paths
-    if not binary:
-        for p in [os.path.expanduser('~/llama.cpp/build/bin/llama-cli'),
-                  os.path.expanduser('~/llama.cpp/main'),
-                  '/usr/local/bin/llama-cli',
-                  os.path.expanduser('~/.local/bin/llama-cli')]:
-            if os.path.isfile(p) and os.access(p, os.X_OK):
-                binary = p
-                break
+    def _serve(path, label):
+        proc = _doe_serve_start(doe, path, port=DOE_PORT)
+        if proc is None:
+            return False
+        env.update(type='doe', url=f'http://127.0.0.1:{DOE_PORT}/v1/chat/completions',
+                   gguf_path=path, binary=doe, proc=proc)
+        print(f"  [ENV] DoE serving {label}: {os.path.basename(path)} (:{DOE_PORT})")
+        return True
 
-    if binary:
-        # hunt for GGUFs — scan common locations
-        gguf_paths = []
-        scan_dirs = ['.', os.path.expanduser('~/.cache'),
-                     os.path.expanduser('~/Downloads'),
-                     os.path.expanduser('~/models'),
-                     os.path.expanduser('~/.local/share/llama.cpp'),
-                     '/tmp']
-        for d in scan_dirs:
-            gguf_paths.extend(glob.glob(os.path.join(d, '**', '*.gguf'), recursive=True))
-            if len(gguf_paths) > 50:
-                break
-
-        if gguf_paths:
-            # prefer coder/instruct models, then smallest that's >1GB (not tiny)
-            coder = [p for p in gguf_paths
-                     if 'coder' in p.lower() or 'instruct' in p.lower()]
-            if coder:
-                pick = min(coder, key=os.path.getsize)
-            else:
-                big_enough = [p for p in gguf_paths if os.path.getsize(p) > 500_000_000]
-                pick = min(big_enough, key=os.path.getsize) if big_enough else gguf_paths[0]
-
-            env.update(type='gguf', binary=binary, gguf_path=pick)
-            size_mb = os.path.getsize(pick) / (1024 * 1024)
-            print(f"  [ENV] GGUF found: {pick} ({size_mb:.0f}MB)")
-            print(f"  [ENV] Binary: {binary}")
-            print(f"  [ENV] Scanned {len(gguf_paths)} GGUFs across {len(scan_dirs)} dirs")
-            return env
-
-    # 4. HuggingFace API
-    hf_token = os.environ.get('HF_TOKEN', '')
-    if hf_token:
-        env.update(type='hf', url='https://router.huggingface.co/v1/chat/completions',
-                   model='Qwen/Qwen2.5-Coder-7B-Instruct', token=hf_token)
-        print(f"  [ENV] HF_TOKEN found, using HuggingFace Inference API")
+    # 1. Ollama coder model
+    ocoders = [m for m in ollama_models if _is_coder_name(m)]
+    if ocoders:
+        env.update(type='ollama', url=OLL, model=ocoders[0])
+        print(f"  [ENV] Ollama coder model: {ocoders[0]}")
         return env
-
-    # 5. Nothing. The organism is alone.
-    print(f"  [ENV] No LLM found. No Ollama, no llama.cpp, no GGUF, no HF_TOKEN.")
-    print(f"  [ENV] self_code will attempt blind AST mutations.")
+    # 2. llama.cpp server identified as a coder
+    if llamacpp_up and _is_coder_name(llamacpp_model):
+        env.update(type='llamacpp', url=LCP, model=llamacpp_model or 'local')
+        print(f"  [ENV] llama.cpp server coder model: {llamacpp_model}")
+        return env
+    # 3. local coder GGUF → DoE
+    if doe and local_coders and _serve(min(local_coders, key=os.path.getsize), 'local coder'):
+        return env
+    # 4. download a whitelisted coder GGUF directly → DoE
+    if doe:
+        dl = _download_coder_gguf(os.path.expanduser('~/models'))
+        if dl and _serve(dl, 'downloaded coder'):
+            return env
+    # 5. last-resort generic (only after we failed to get a real coder)
+    if ollama_models:
+        env.update(type='ollama', url=OLL, model=ollama_models[0])
+        print(f"  [ENV] generic Ollama model (no coder available): {ollama_models[0]}")
+        return env
+    if llamacpp_up:
+        env.update(type='llamacpp', url=LCP, model=llamacpp_model or 'local')
+        print(f"  [ENV] generic llama.cpp server (model unidentified)")
+        return env
+    if doe and local_ggufs:
+        big = [p for p in local_ggufs if os.path.getsize(p) > 500_000_000]
+        pick = min(big, key=os.path.getsize) if big else min(local_ggufs, key=os.path.getsize)
+        if _serve(pick, 'generic GGUF'):
+            return env
+    # 6. nothing
+    print(f"  [ENV] No coder (no Ollama / llama.cpp-server / DoE+GGUF). self_code → blind.")
     return env
 
 
@@ -1890,7 +2030,7 @@ def _llm_chat(llm_env, system_prompt, user_prompt, max_tokens=800, temperature=0
 
     ctx = ssl.create_default_context()   # verify on + check_hostname (was CERT_NONE — corpus-poisoning vector for a self-feeding organism)
 
-    if llm_env['type'] in ('ollama', 'llamacpp', 'hf'):
+    if llm_env['type'] in ('ollama', 'llamacpp'):   # local servers only — no hosted API
         payload = _json.dumps({
             "model": llm_env['model'],
             "messages": [
@@ -1905,8 +2045,6 @@ def _llm_chat(llm_env, system_prompt, user_prompt, max_tokens=800, temperature=0
             req = Request(llm_env['url'], data=payload, method='POST')
             req.add_header('Content-Type', 'application/json')
             req.add_header('User-Agent', 'nanoagi/1.0 (self-code)')
-            if llm_env.get('token'):
-                req.add_header('Authorization', f'Bearer {llm_env["token"]}')
             timeout = 120 if llm_env['type'] == 'ollama' else 90
             response = urlopen(req, timeout=timeout, context=ctx)
             result = _json.loads(response.read().decode('utf-8'))
@@ -1915,34 +2053,50 @@ def _llm_chat(llm_env, system_prompt, user_prompt, max_tokens=800, temperature=0
             print(f"  [SELF-CODE] {llm_env['type']} error: {e}")
             return None
 
-    elif llm_env['type'] == 'gguf':
-        import subprocess, tempfile
-        prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
+    elif llm_env['type'] == 'doe':
+        # DoE serves /v1/chat/completions but STREAMS SSE: `data: {"token":"..."}` per token,
+        # `data: {"done":true}` at end. DoE reads only the user message and applies the GGUF's
+        # own chat template, so fold system + user into one user message. (DoE caps the user
+        # message ~2048 bytes — self_code keeps the prompt compact.)
+        combined = f"{system_prompt}\n\n{user_prompt}"
+        payload = _json.dumps({
+            "messages": [{"role": "user", "content": combined}],
+            "max_tokens": max_tokens, "temperature": temperature,
+        }).encode('utf-8')
         try:
-            r = subprocess.run(
-                [llm_env['binary'], '-m', llm_env['gguf_path'],
-                 '-p', prompt, '-n', str(max_tokens), '--temp', str(temperature),
-                 '-t', str(min(os.cpu_count() or 4, 8)), '--no-display-prompt'],
-                capture_output=True, text=True, timeout=300)
-            if r.returncode == 0 and r.stdout.strip():
-                return r.stdout.strip()
-            else:
-                print(f"  [SELF-CODE] GGUF inference failed: {r.stderr[:200]}")
-                return None
+            req = Request(llm_env['url'], data=payload, method='POST')
+            req.add_header('Content-Type', 'application/json')
+            req.add_header('User-Agent', 'nanoagi/1.0 (self-code)')
+            resp = urlopen(req, timeout=300, context=ctx)
+            out = []
+            for raw in resp:
+                line = raw.decode('utf-8', 'replace').strip()
+                if not line.startswith('data:'):
+                    continue
+                try:
+                    obj = _json.loads(line[5:].strip())
+                except Exception:
+                    continue
+                if obj.get('done'):
+                    break
+                if 'token' in obj:
+                    out.append(obj['token'])
+            text = ''.join(out).strip()
+            return text or None
         except Exception as e:
-            print(f"  [SELF-CODE] GGUF error: {e}")
+            print(f"  [SELF-CODE] DoE error: {e}")
             return None
 
     return None
 
 
-def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
-              hf_token=None, max_attempts=3):
+def self_code(karl, karl_txt_path, max_attempts=3):
     """
     The organism reads its own source code, sends it to a code LLM,
     applies the suggested improvement, tests it, keeps or reverts.
 
-    Survival chain: Ollama → llama.cpp → local GGUF → HF API → blind mutation.
+    Survival chain: Ollama coder → llama.cpp coder → local coder GGUF → DIRECT coder
+    GGUF download from HF (no token) → generic local LLM → blind mutation. No hosted API.
     The organism does not ask permission. It finds a way or makes one.
     """
     try:
@@ -1981,9 +2135,9 @@ def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
             end = min(len(lines), i + 60)
             key_sections.append('\n'.join(lines[start:end]))
 
-    context = '\n\n---\n\n'.join(key_sections[:5])  # max 5 sections
-    if len(context) > 12000:
-        context = context[:12000] + "\n... (truncated)"
+    # Compact prompt: ONE focused section, capped to fit DoE's ~2KB serve buffer. The README
+    # intent is "suggest ONE small improvement" — a surgical snippet, not a 12KB source dump.
+    context = (random.choice(key_sections) if key_sections else source)[:1200]
 
     llm_name = (f"{llm['type']}:{llm.get('model') or llm.get('gguf_path','?')}")
     print("\n" + "=" * 60)
@@ -2039,6 +2193,7 @@ def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
         test_dir = os.path.join(os.path.dirname(src_path), 'tests')
         if _run_test_suite(test_dir):
             print(f"  [SELF-CODE] Tests PASS. Keeping patch: {desc}")
+            _stop_llm(llm)
             return {'description': desc, 'old_code': old_code,
                     'new_code': new_code, 'status': 'applied'}
         print(f"  [SELF-CODE] Tests FAIL. Reverting.")
@@ -2048,6 +2203,7 @@ def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
         source = backup
 
     print(f"\n  [SELF-CODE] {max_attempts} attempts exhausted. No improvement applied.")
+    _stop_llm(llm)
     return None
 
 
@@ -2107,7 +2263,7 @@ def load_engine():
         token_ids = karl.encode(raw_data)
         print(f"  Loaded previous state. Encoding: {len(token_ids)} tokens")
     else:
-        token_ids = karl.learn(raw_data, num_merges=1024)
+        token_ids = karl.learn(raw_data, num_merges=512)   # boot vocab 256+512=768 (matches README)
         karl.save_state(KARL_MEM)
         print(f"  Saved state to {os.path.basename(KARL_MEM)}")
 
@@ -2365,17 +2521,20 @@ def repl(karl, meta, model):
     print("  nanoagi REPL — talk to Karl")
     print("  type text → generate continuation")
     print("  paste large text → Karl ingests it")
-    print("  'hunt' → Karl searches local files for food")
+    print("  'hunt' / 'feed' → Karl searches local files / autonomous climbmix hunt")
+    print("  'fetch <url>' → download a URL's text and ingest it")
     print("  'evolve [N]' → self-improvement ratchet loop (N experiments)")
+    print("  'autoself on|off' → autonomous self-code on evolve stagnation (default off)")
     print("  'coevolve' → co-evolution: hunt data + evolve architecture")
-    print("  'swarm [N]' → release N hyenas (parallel genome exploration)")
-    print("  'selfcode' → ask a code LLM to improve nanoagi (needs HF_TOKEN)")
+    print("  'swarm [N]' → release N hyenas (sequential genome exploration)")
+    print("  'selfcode' → find/download a coder LLM and let it improve nanoagi (no token)")
     print("  'status' → Karl's state | 'quit' → exit")
     print("=" * 60)
     print("\n  Hello! I am a helpful AGI. At least I try.")
     print("  How can I help you?\n")
 
     step = 0
+    auto_self = False   # opt-in: autonomous self_code on evolve stagnation (README §autonomy)
     while True:
         try:
             user_input = input("\nkarl> ")
@@ -2386,6 +2545,23 @@ def repl(karl, meta, model):
             continue
         if user_input.strip().lower() == 'quit':
             break
+        if user_input.strip().lower().startswith('autoself'):
+            parts = user_input.strip().lower().split()
+            auto_self = (len(parts) > 1 and parts[1] == 'on')
+            print(f"  [SELF] autonomous self-code on stagnation: {'ON' if auto_self else 'OFF'}")
+            continue
+        if user_input.strip().lower().startswith('fetch '):
+            url = user_input.strip().split(None, 1)[1].strip()
+            try:
+                from urllib.request import urlopen, Request
+                import ssl
+                req = Request(url, headers={'User-Agent': 'nanoagi/1.0 (fetch)'})
+                txt = urlopen(req, timeout=30, context=ssl.create_default_context()).read()
+                karl.ingest(txt.decode('utf-8', 'replace').encode('utf-8'))
+                print(f"  [FETCH] ingested {len(txt)} bytes from {url}")
+            except Exception as e:
+                print(f"  [FETCH] failed: {e}")
+            continue
         if user_input.strip().lower() == 'status':
             print(f"  [KARL] vocab={karl.vocab_size}, merges={len(karl.merges)}, "
                   f"ingested={karl.total_ingested}B, retrains={karl.retrain_count}")
@@ -2423,7 +2599,8 @@ def repl(karl, meta, model):
             with open(KARL_TXT, 'rb') as f:
                 corpus = f.read()
             tids = karl.encode(corpus)
-            self_improve(karl, tids, max_experiments=n_exp, train_seconds=30)
+            self_improve(karl, tids, max_experiments=n_exp, train_seconds=30,
+                         auto_self_code=auto_self)
             continue
         if user_input.strip().lower() == 'coevolve':
             coevolve(karl, KARL_TXT, max_rounds=3, evolve_per_round=5,
@@ -2628,6 +2805,23 @@ def main():
                 except ValueError:
                     pass
         self_improve(karl, token_ids, max_experiments=n, train_seconds=30)
+        return
+
+    # Self-evolve mode — opt-in autonomous self-code on stagnation (README §autonomy):
+    #   python3 nanoagi.py --self-evolve [N]
+    if '--self-evolve' in sys.argv:
+        with open(KARL_TXT, 'rb') as f:
+            corpus = f.read()
+        token_ids = karl.encode(corpus)
+        n = 50
+        for i, arg in enumerate(sys.argv):
+            if arg == '--self-evolve' and i + 1 < len(sys.argv):
+                try:
+                    n = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+        self_improve(karl, token_ids, max_experiments=n, train_seconds=30,
+                     auto_self_code=True)
         return
 
     # If command-line prompt given, generate and exit
