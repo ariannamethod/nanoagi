@@ -17,6 +17,7 @@ import random
 import struct
 import subprocess
 import platform
+import shutil
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOAD libnotorch
@@ -24,30 +25,47 @@ import platform
 
 _dir = os.path.dirname(os.path.abspath(__file__))
 
-# Build type of the libnotorch we end up using: True = BLAS backend (fast matmul),
-# False = plain CPU naive matmul, None = pre-existing lib of unknown build.
+# Backend of the libnotorch we end up using: 'cuda' | 'blas' | 'cpu' | None (a
+# pre-existing lib of unknown build). NOTORCH_BLAS kept for back-compat.
+NOTORCH_BACKEND = None
 NOTORCH_BLAS = None
 
 
 def _compile_libnotorch(src, out):
-    """Compile libnotorch, preferring a BLAS backend for fast matmul (Accelerate on
-    macOS, OpenBLAS on Linux); fall back to the plain CPU build if the BLAS toolchain
-    isn't present. Same auto-detect-with-CPU-fallback rule as the GPU path. Returns
-    True if the BLAS build succeeded, False for the CPU fallback."""
+    """Compile libnotorch, preferring the fastest available backend, with fallback:
+    CUDA (nvcc + notorch_cuda.cu, on a GPU box) → BLAS (Accelerate on macOS, OpenBLAS
+    on Linux) → plain CPU. Same auto-detect-with-fallback rule the runtime uses for
+    the GPU. Returns 'cuda' | 'blas' | 'cpu'."""
     base = ['cc', '-O2', '-std=c11', '-shared', '-fPIC']
+    cuda_src = os.path.join(_dir, 'notorch_cuda.cu')
+    # 1) CUDA: nvcc the kernels, then link notorch.c + cuBLAS/cudart (+BLAS for CPU ops)
+    if shutil.which('nvcc') and os.path.exists(cuda_src):
+        try:
+            cu_o = os.path.join(_dir, 'notorch_cuda.o')
+            if subprocess.run(['nvcc', '-O2', '-DUSE_CUDA', '-c', cuda_src, '-o', cu_o],
+                              capture_output=True, text=True).returncode == 0:
+                link = base + ['-DUSE_CUDA', '-DUSE_BLAS', '-I/usr/local/cuda/include',
+                               '-o', out, src, cu_o,
+                               '-L/usr/local/cuda/lib64', '-lcudart', '-lcublas',
+                               '-lopenblas', '-lm']
+                if subprocess.run(link, capture_output=True, text=True).returncode == 0:
+                    return 'cuda'
+        except Exception:
+            pass
+    # 2) BLAS: notorch.c picks <Accelerate/Accelerate.h> only under -DACCELERATE
     if platform.system() == 'Darwin':
-        # notorch.c picks <Accelerate/Accelerate.h> only under -DACCELERATE (else <cblas.h>)
         blas = base + ['-DUSE_BLAS', '-DACCELERATE', '-o', out, src, '-framework', 'Accelerate', '-lm']
     else:
         blas = base + ['-DUSE_BLAS', '-o', out, src, '-lopenblas', '-lm']
+    # 3) plain CPU
     cpu = base + ['-o', out, src, '-lm']
-    for cmd, is_blas in ((blas, True), (cpu, False)):
+    for cmd, tag in ((blas, 'blas'), (cpu, 'cpu')):
         try:
             if subprocess.run(cmd, capture_output=True, text=True).returncode == 0:
-                return is_blas
+                return tag
         except Exception:
             pass
-    raise RuntimeError("libnotorch compile failed (both BLAS and CPU builds)")
+    raise RuntimeError("libnotorch compile failed (CUDA, BLAS and CPU)")
 
 
 for ext in ['.dylib', '.so', '.dll']:
@@ -58,9 +76,25 @@ else:
     _src = os.path.join(_dir, 'notorch.c')
     _libpath = os.path.join(_dir, 'libnotorch.dylib')
     if os.path.exists(_src):
-        NOTORCH_BLAS = _compile_libnotorch(_src, _libpath)
+        NOTORCH_BACKEND = _compile_libnotorch(_src, _libpath)
+        NOTORCH_BLAS = NOTORCH_BACKEND in ('blas', 'cuda')
 
 _lib = ctypes.CDLL(_libpath)
+
+# GPU auto-detect (molequla pattern): a CUDA build exposes gpu_init / nt_set_gpu_mode;
+# enable device dispatch when a GPU is actually present, else stay on CPU/BLAS. No flag.
+NOTORCH_GPU = False
+if hasattr(_lib, 'gpu_init') and hasattr(_lib, 'nt_set_gpu_mode'):
+    _lib.gpu_init.restype = ctypes.c_int
+    _lib.nt_set_gpu_mode.argtypes = [ctypes.c_int]
+    if hasattr(_lib, 'nt_gpu_dispatch_count'):
+        _lib.nt_gpu_dispatch_count.restype = ctypes.c_longlong
+    try:
+        if _lib.gpu_init() == 0:
+            _lib.nt_set_gpu_mode(1)
+            NOTORCH_GPU = True
+    except Exception:
+        NOTORCH_GPU = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # C FUNCTION SIGNATURES
@@ -85,7 +119,7 @@ _lib.nt_tape_no_decay.argtypes = [ctypes.c_int]
 _lib.nt_tape_backward.argtypes = [ctypes.c_int]
 _lib.nt_tape_clip_grads.restype = ctypes.c_float
 _lib.nt_tape_clip_grads.argtypes = [ctypes.c_float]
-_lib.nt_tape_chuck_step.argtypes = [ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float]
+_lib.nt_tape_chuck_step.argtypes = [ctypes.c_float, ctypes.c_float]  # canon Chuck: (lr, loss_val)
 _lib.nt_tape_adam_step.argtypes = [ctypes.c_float]
 _lib.nt_tape_adamw_step.argtypes = [ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float]
 _lib.nt_train_mode.argtypes = [ctypes.c_int]
@@ -157,6 +191,7 @@ class _NtTapeEntry(ctypes.Structure):
         ("aux4", ctypes.c_float),
         ("is_param", ctypes.c_int),
         ("no_decay", ctypes.c_int),
+        ("frozen", ctypes.c_int),   # canon nt_tape_entry (LoRA frozen-base); mirror or stride is wrong
     ]
 
 
@@ -424,8 +459,10 @@ class NotorchEngine:
         self.model = model
         self.lr = lr
         self.weight_decay = weight_decay
-        # beta1/beta2 feed Chuck's Adam-style momentum (m/v decay in nt_tape_chuck_step) —
-        # the C signature was extended to take them, so the evolved beta genes now matter.
+        # beta1/beta2 are kept for API compatibility but inert: canon Chuck
+        # (nt_tape_chuck_step(lr, loss)) manages its own momentum decay internally with
+        # tuned constants. The earlier 4-arg beta override was a local divergence from
+        # canon notorch; reconciled back to the production-proven 2-arg Chuck.
         self.beta1 = beta1
         self.beta2 = beta2
         # Deduplicate tied weights (e.g. wte == lm_head)
@@ -551,8 +588,7 @@ class NotorchEngine:
         if update:
             _lib.nt_tape_backward(loss_idx)
             _lib.nt_tape_clip_grads(ctypes.c_float(1.0))
-            _lib.nt_tape_chuck_step(ctypes.c_float(self.lr), ctypes.c_float(loss_val),
-                                    ctypes.c_float(self.beta1), ctypes.c_float(self.beta2))
+            _lib.nt_tape_chuck_step(ctypes.c_float(self.lr), ctypes.c_float(loss_val))
             # Decoupled weight decay (AdamW-style): θ *= (1 - lr*wd). Honors the evolved
             # weight_decay gene, which used to be dropped (only lr reached the engine).
             if self.weight_decay > 0.0:
@@ -683,9 +719,18 @@ def seed(s):
     _lib.nt_seed(ctypes.c_uint64(s))
 
 
+def gpu_dispatch_count():
+    """cuBLAS dispatch count — >0 proves the training tape's matvecs reached the GPU
+    (criterion-4 proof on a CUDA build). 0 on CPU/BLAS builds."""
+    if hasattr(_lib, 'nt_gpu_dispatch_count'):
+        return int(_lib.nt_gpu_dispatch_count())
+    return 0
+
+
 __all__ = [
     'Tensor', 'Parameter', 'Module', 'Linear', 'Embedding', 'RMSNorm',
     'Block', 'NotorchNanoAGI', 'NotorchEngine',
     'softmax', 'silu', 'cross_entropy', 'multinomial', 'seed',
+    'NOTORCH_BACKEND', 'NOTORCH_BLAS', 'NOTORCH_GPU', 'gpu_dispatch_count',
     '_lib',
 ]
