@@ -529,6 +529,13 @@ class NanoAGI:
         self.n_layer = n_layer
         self.n_content = n_content
         self.n_rrpram = n_rrpram
+        # Architectural invariants — fail loud, not via a silent OOB in output proj.
+        if n_embd % n_head != 0:
+            raise ValueError(f"n_embd ({n_embd}) must be divisible by n_head ({n_head})")
+        if n_content + n_rrpram != n_head:
+            raise ValueError(
+                f"n_content + n_rrpram ({n_content}+{n_rrpram}) must equal n_head "
+                f"({n_head}) — the two head groups concat back to n_embd")
         self.head_dim = n_embd // n_head
 
         # Embeddings (no position — RoPE handles it)
@@ -1001,16 +1008,23 @@ def autoresearch(karl, karl_txt_path, min_bytes=50000):
 
 
 def _has_internet():
-    """Check if HuggingFace datasets API is reachable."""
+    """Check if the HuggingFace datasets ROWS API is actually reachable.
+
+    Probes the real /rows endpoint (length=1) — the old bare-root HEAD returned
+    non-2xx even when the API worked (false-negative that wrongly gated
+    autoresearch_hunt offline; tool-confirmed: HEAD failed while /rows downloaded).
+    """
     try:
         from urllib.request import urlopen, Request
         import ssl
         ctx = ssl.create_default_context()   # verify on + check_hostname (was CERT_NONE — corpus-poisoning vector for a self-feeding organism)
-        req = Request("https://datasets-server.huggingface.co/",
-                      method='HEAD')
+        url = ("https://datasets-server.huggingface.co/rows"
+               "?dataset=karpathy/climbmix-400b-shuffle"
+               "&config=default&split=train&offset=0&length=1")
+        req = Request(url)
         req.add_header('User-Agent', 'nanoagi/1.0 (KARL)')
-        urlopen(req, timeout=5, context=ctx)
-        return True
+        with urlopen(req, timeout=8, context=ctx) as r:
+            return r.status == 200
     except Exception:
         return False
 
@@ -1299,7 +1313,7 @@ def _evaluate_genome(karl, token_ids, genome, train_seconds=30, device=None):
     )
     engine = NotorchEngine(tmodel, lr=g['lr'], weight_decay=g['weight_decay'],
                            beta1=g['beta1'], beta2=g['beta2'])
-    n_params = tmodel.n_params()
+    n_params = sum(p.numel for p in engine.params)  # deduped (tied wte/lm_head once)
 
     # Train for fixed wall-clock time
     t0 = time.time()
@@ -1335,7 +1349,7 @@ def _evaluate_genome(karl, token_ids, genome, train_seconds=30, device=None):
 
 def self_improve(karl, token_ids, max_experiments=50, train_seconds=30,
                  total_budget=3600, results_file=None,
-                 stagnation_threshold=10, auto_self_code=True):
+                 stagnation_threshold=10, auto_self_code=False):
     """
     The Ratchet Loop — nanoagi evolves its own architecture.
 
@@ -1610,8 +1624,6 @@ def swarm(karl, token_ids, n_hyenas=4, mutations_per_hyena=10,
         print("  [SWARM] Need notorch. The hyenas are sleeping.")
         return None
 
-    import threading
-
     print("\n" + "=" * 60)
     print(f"  SWARM — releasing {n_hyenas} hyenas")
     print(f"  mutations/hyena: {mutations_per_hyena}, "
@@ -1621,22 +1633,16 @@ def swarm(karl, token_ids, n_hyenas=4, mutations_per_hyena=10,
     results = [None] * n_hyenas
     seeds = [random.randint(0, 999999) for _ in range(n_hyenas)]
 
-    def mission(idx):
-        results[idx] = _hyena_explore(
-            karl, token_ids, seeds[idx],
-            n_mutations=mutations_per_hyena,
-            train_seconds=train_seconds)
-
+    # Sequential, NOT threaded: notorch's tape is a single global (g_tape), so
+    # concurrent engine.step() calls race and corrupt it. Each hyena still explores
+    # a different genome region via its own seed; the pack shares results at the end.
     t0 = time.time()
-    threads = []
     for i in range(n_hyenas):
         print(f"  [SWARM] Releasing hyena-{i} (seed={seeds[i]})")
-        t = threading.Thread(target=mission, args=(i,), daemon=True)
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join(timeout=600)
+        results[i] = _hyena_explore(
+            karl, token_ids, seeds[i],
+            n_mutations=mutations_per_hyena,
+            train_seconds=train_seconds)
 
     elapsed = time.time() - t0
 
@@ -1664,8 +1670,7 @@ def swarm(karl, token_ids, n_hyenas=4, mutations_per_hyena=10,
         print(f"  Pack leader: hyena-{leader} (bpb={best_bpb:.4f})")
     if best_genome:
         print(f"  Best genome: {best_genome}")
-    print(f"  Time: {elapsed:.0f}s "
-          f"(vs ~{elapsed * n_hyenas:.0f}s sequential)")
+    print(f"  Time: {elapsed:.0f}s ({n_hyenas} hyenas, sequential)")
     print(f"{'=' * 60}")
 
     return best_genome, best_bpb
@@ -1689,10 +1694,37 @@ to the architecture or training loop. Return ONLY a JSON object:
 Do not explain. Do not add comments. Just the JSON."""
 
 
+def _run_test_suite(test_dir, timeout=120):
+    """Run the nanoagi unittest suite and return True iff it passes.
+
+    Uses the suite's own runner (python tests/test_nanoagi.py) — NOT pytest, which
+    isn't installed here, so the old `-m pytest` gate always returned non-zero and
+    made self-modification ALWAYS revert (a silent no-op).
+    """
+    import subprocess
+    test_file = os.path.join(test_dir, 'test_nanoagi.py')
+    try:
+        r = subprocess.run([sys.executable, test_file],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _atomic_write(path, content):
+    """Write atomically (temp file + os.replace) so a crash mid-write can never
+    leave the live source half-written — the in-place writes used before could
+    corrupt nanoagi.py itself if the process died between write and revert."""
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
 def _blind_mutate(karl, karl_txt_path):
     """
     Last resort: no LLM available anywhere. The organism mutates itself
-    using only its own code — random but targeted AST-level changes.
+    using only its own code — random but targeted changes to real knobs.
     Like bacteria mutating without horizontal gene transfer.
     Slower, dumber, but alive.
     """
@@ -1701,48 +1733,32 @@ def _blind_mutate(karl, karl_txt_path):
     with open(src_path, 'r') as f:
         source = f.read()
     backup = source
-    lines = source.split('\n')
 
-    # Targeted mutations: things that actually affect training quality
+    # Targeted mutations on knobs that ACTUALLY exist in this source and affect
+    # training/generation quality (the old list named nt_gelu/dropout that don't
+    # exist, and a bare '0.02' first-match that hit an arbitrary init).
     mutations = [
-        # learning rate tweaks
         ('lr=3e-4', f'lr={random.choice(["1e-4", "5e-4", "2e-4", "7e-4"])}'),
-        ('lr = 3e-4', f'lr = {random.choice(["1e-4", "5e-4", "2e-4", "7e-4"])}'),
-        # activation swaps
-        ('nt_gelu', 'nt_silu'),
-        ('nt_silu', 'nt_gelu'),
-        # dropout tweaks
-        ('dropout=0.1', f'dropout={random.choice(["0.05", "0.15", "0.2", "0.0"])}'),
-        # weight init scale
-        ('0.02', f'{random.choice(["0.01", "0.03", "0.05"])}'),
+        ('self.alpha_hebbian = 0.3', f'self.alpha_hebbian = {random.choice(["0.2", "0.4", "0.5"])}'),
+        ('self.beta_prophecy = 0.2', f'self.beta_prophecy = {random.choice(["0.1", "0.3", "0.4"])}'),
+        ('self.gamma_destiny = 0.15', f'self.gamma_destiny = {random.choice(["0.1", "0.2", "0.25"])}'),
+        ('top_k = 15', f'top_k = {random.choice(["10", "20", "25"])}'),
     ]
 
+    test_dir = os.path.join(os.path.dirname(src_path), 'tests')
     # pick a random mutation that matches
     random.shuffle(mutations)
     for old, new in mutations:
         if old in source and old != new:
-            new_source = source.replace(old, new, 1)
-            with open(src_path, 'w') as f:
-                f.write(new_source)
+            _atomic_write(src_path, source.replace(old, new, 1))
             print(f"  [BLIND] Mutation: '{old}' → '{new}'")
 
-            # test
-            import subprocess, sys
-            test_dir = os.path.join(os.path.dirname(src_path), 'tests')
-            try:
-                r = subprocess.run(
-                    [sys.executable, '-m', 'pytest', test_dir, '-q', '--tb=no'],
-                    capture_output=True, text=True, timeout=120)
-                if r.returncode == 0:
-                    print(f"  [BLIND] Tests PASS. Mutation kept.")
-                    return {'description': f'blind: {old} → {new}',
-                            'old_code': old, 'new_code': new, 'status': 'applied'}
-            except Exception:
-                pass
+            if _run_test_suite(test_dir):
+                print(f"  [BLIND] Tests PASS. Mutation kept.")
+                return {'description': f'blind: {old} → {new}',
+                        'old_code': old, 'new_code': new, 'status': 'applied'}
 
-            # revert
-            with open(src_path, 'w') as f:
-                f.write(backup)
+            _atomic_write(src_path, backup)   # revert
             print(f"  [BLIND] Tests FAIL. Reverted.")
 
     print(f"  [BLIND] No viable mutations found.")
@@ -2016,31 +2032,19 @@ def self_code(karl, karl_txt_path, model_id="Qwen/Qwen2.5-Coder-7B-Instruct",
             print(f"  [SELF-CODE] old_code not found in source. Retrying.")
             continue
 
-        new_source = source.replace(old_code, new_code, 1)
-        with open(src_path, 'w') as f:
-            f.write(new_source)
+        _atomic_write(src_path, source.replace(old_code, new_code, 1))
         print(f"  [SELF-CODE] Patch applied.")
 
-        # Test
-        import subprocess
+        # Test with the suite's own runner (pytest isn't installed → old gate always reverted)
         test_dir = os.path.join(os.path.dirname(src_path), 'tests')
-        try:
-            r = subprocess.run(
-                [sys.executable, '-m', 'pytest', test_dir, '-q', '--tb=no'],
-                capture_output=True, text=True, timeout=120)
-            if r.returncode == 0:
-                print(f"  [SELF-CODE] Tests PASS. Keeping patch: {desc}")
-                return {'description': desc, 'old_code': old_code,
-                        'new_code': new_code, 'status': 'applied'}
-            else:
-                print(f"  [SELF-CODE] Tests FAIL. Reverting.")
-                print(f"  {r.stdout.strip().split(chr(10))[-1]}")
-        except subprocess.TimeoutExpired:
-            print(f"  [SELF-CODE] Tests timed out. Reverting.")
+        if _run_test_suite(test_dir):
+            print(f"  [SELF-CODE] Tests PASS. Keeping patch: {desc}")
+            return {'description': desc, 'old_code': old_code,
+                    'new_code': new_code, 'status': 'applied'}
+        print(f"  [SELF-CODE] Tests FAIL. Reverting.")
 
         # Revert
-        with open(src_path, 'w') as f:
-            f.write(backup)
+        _atomic_write(src_path, backup)
         source = backup
 
     print(f"\n  [SELF-CODE] {max_attempts} attempts exhausted. No improvement applied.")

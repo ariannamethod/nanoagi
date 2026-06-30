@@ -544,7 +544,8 @@ class TestAutoresearch(unittest.TestCase):
 # VI. Chuck training loop tests (requires PyTorch)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@unittest.skipUnless(_REAL_TORCH,"PyTorch not available")
+@unittest.skip("legacy torch ChuckOptimizer/TorchNanoAGI — depythonized to notorch; "
+               "Chuck now covered live by TestChuckNotorch (chuck_train + grad-check)")
 class TestChuck(unittest.TestCase):
 
     def setUp(self):
@@ -870,7 +871,7 @@ class TestSelfImprove(unittest.TestCase):
         self.karl = make_karl(merges=64)
         self.meta, self.ids = make_meta(self.karl)
 
-    @unittest.skipUnless(_REAL_TORCH,"PyTorch required")
+    @unittest.skipUnless(getattr(nanoagi, 'NOTORCH_AVAILABLE', False), "notorch not available")
     def test_evaluate_genome_returns_finite_bpb(self):
         """_evaluate_genome must return a finite BPB with enough data."""
         g = nanoagi.Genome()
@@ -882,7 +883,7 @@ class TestSelfImprove(unittest.TestCase):
         self.assertGreater(n_params, 0)
         self.assertGreater(steps, 0)
 
-    @unittest.skipUnless(_REAL_TORCH,"PyTorch required")
+    @unittest.skipUnless(getattr(nanoagi, 'NOTORCH_AVAILABLE', False), "notorch not available")
     def test_evaluate_genome_different_configs(self):
         """Different genomes should produce different results."""
         g1 = nanoagi.Genome()
@@ -898,7 +899,7 @@ class TestSelfImprove(unittest.TestCase):
             self.karl, self.ids, g2, train_seconds=2)
         self.assertNotEqual(p1, p2)
 
-    @unittest.skipUnless(_REAL_TORCH,"PyTorch required")
+    @unittest.skipUnless(getattr(nanoagi, 'NOTORCH_AVAILABLE', False), "notorch not available")
     def test_self_improve_runs_and_logs(self):
         """self_improve should run 3 experiments and produce results.tsv."""
         import io
@@ -931,25 +932,71 @@ class TestSelfImprove(unittest.TestCase):
         finally:
             os.unlink(results_path)
 
-    @unittest.skipUnless(_REAL_TORCH,"PyTorch required")
-    def test_torch_nanoagi_module_level(self):
-        """TorchNanoAGI at module level should build and forward."""
-        import torch
-        tmodel = nanoagi.TorchNanoAGI(
-            vocab_size=self.karl.vocab_size,
-            n_embd=32, n_head=2, n_layer=1, ctx=32,
-            n_content=1, n_rrpram=1)
-        x = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
-        logits, loss = tmodel(x)
-        self.assertEqual(logits.shape[0], 1)
-        self.assertEqual(logits.shape[1], 5)
-        self.assertEqual(logits.shape[2], self.karl.vocab_size)
-        self.assertIsNone(loss)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VIII. Mythos-revival tests — the fixes that raised code to the README
 # ─────────────────────────────────────────────────────────────────────────────
+
+@unittest.skipUnless(getattr(nanoagi, 'NOTORCH_AVAILABLE', False), "notorch not available")
+class TestChuckNotorch(unittest.TestCase):
+    """Chuck on notorch — replaces the legacy torch ChuckOptimizer tests. Proves the
+    notorch autograd is correct (finite differences) and that Chuck reduces loss."""
+
+    def setUp(self):
+        self.karl = make_karl(merges=64)
+        self.meta, self.ids = make_meta(self.karl)
+
+    def test_notorch_autograd_finite_difference(self):
+        """Analytic notorch gradients must match central finite differences — the
+        proof the autograd (hence any training claim) is correct. The float32
+        finite-difference floor is ~1e-3; a real autograd bug would produce errors of
+        order the gradient magnitude (1e-2..1e0), far above the 5e-3 bound."""
+        import random as _r
+        from ariannamethod.notorch_nn import NotorchNanoAGI, NotorchEngine, seed as nt_seed
+        nt_seed(7)
+        V = self.karl.vocab_size
+        m = NotorchNanoAGI(V, n_embd=32, n_head=2, n_layer=1, ctx=16,
+                           n_content=1, n_rrpram=1)
+        eng = NotorchEngine(m)
+        x = [t % V for t in range(16)]
+        y = [t % V for t in range(1, 17)]
+        _r.seed(1)
+        worst_abs = 0.0
+        checks = 0
+        for pi in range(len(eng.params)):
+            n = eng.params[pi].numel
+            for _ in range(4):
+                elem = _r.randint(0, n - 1)
+                ga, gn = eng.grad_check(x, y, pi, elem, eps=1e-3)
+                worst_abs = max(worst_abs, abs(ga - gn))
+                checks += 1
+        self.assertGreater(checks, 0)
+        self.assertLess(worst_abs, 5e-3,
+                        f"notorch autograd disagrees with finite diff: |Δ|={worst_abs:.5f}")
+
+    def test_chuck_train_reduces_loss(self):
+        """Chuck must reduce loss over 200 steps (the notorch money test)."""
+        import random as _r
+        from ariannamethod.notorch_nn import NotorchNanoAGI, NotorchEngine, seed as nt_seed
+        nt_seed(42)
+        V = self.karl.vocab_size
+        m = NotorchNanoAGI(V, n_embd=48, n_head=2, n_layer=2, ctx=32,
+                           n_content=1, n_rrpram=1)
+        eng = NotorchEngine(m, lr=3e-4)
+        ctx = 32
+        _r.seed(7)
+        first, last = [], []
+        steps = 200
+        for s in range(steps):
+            i = _r.randint(0, max(0, len(self.ids) - ctx - 2))
+            loss = eng.step(self.ids[i:i+ctx], self.ids[i+1:i+ctx+1])
+            if s < 10:
+                first.append(loss)
+            elif s >= steps - 10:
+                last.append(loss)
+        self.assertLess(sum(last) / len(last), sum(first) / len(first))
+
 
 @unittest.skipUnless(getattr(nanoagi, 'NOTORCH_AVAILABLE', False), "notorch not available")
 class TestRevival(unittest.TestCase):

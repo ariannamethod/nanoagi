@@ -323,6 +323,15 @@ class NotorchNanoAGI(Module):
         self.ctx = ctx
         self.n_content = n_content
         self.n_rrpram = n_rrpram
+        # Architectural invariants — fail loud, not via a silent OOB read in the
+        # output projection. content + rrpram heads are concatenated back to n_embd,
+        # so (n_content + n_rrpram) * (n_embd // n_head) must equal n_embd.
+        if n_embd % n_head != 0:
+            raise ValueError(f"n_embd ({n_embd}) must be divisible by n_head ({n_head})")
+        if n_content + n_rrpram != n_head:
+            raise ValueError(
+                f"n_content + n_rrpram ({n_content}+{n_rrpram}) must equal n_head "
+                f"({n_head}) — the two head groups concat back to n_embd")
         hd = n_embd // n_head
         self.hd = hd
 
@@ -421,6 +430,7 @@ class NotorchEngine:
         for p in self.params:
             idx = _lib.nt_tape_param(p._ptr)
             tape_ids.append(idx)
+        self._last_tape_ids = tape_ids   # param i lives at tape index tape_ids[i] (grad_check)
 
         # Token tensor (the target lives in step() — the forward needs only inputs)
         tok_t = Tensor.zeros(T)
@@ -548,6 +558,41 @@ class NotorchEngine:
         row = [lts.data[base + j] for j in range(V)]
         _lib.nt_tape_clear()
         return row
+
+    def grad_check(self, token_ids, target_ids, param_idx, elem, eps=1e-3):
+        """Finite-difference verification of the notorch autograd for ONE weight.
+
+        Returns (analytic, numeric): the analytic gradient read from the tape after
+        backward, and the central-difference numeric gradient (L(+eps)-L(-eps))/2eps.
+        They must agree — this is the proof that notorch trains correctly (the
+        foundation under any training claim). Deterministic: no dropout in forward.
+        """
+        T = len(token_ids)
+        V = self.model.vocab_size
+        # analytic: forward + cross-entropy + backward, read the param's grad off the tape
+        logits = self._forward(token_ids)
+        tids = self._last_tape_ids
+        tgt_t = Tensor.zeros(T)
+        tgt_t.set_data([float(x) for x in target_ids])
+        tgt_idx = _lib.nt_tape_record(tgt_t._ptr, 0, -1, -1, ctypes.c_float(0))
+        tgt_t._owns = False
+        loss_idx = _lib.nt_seq_cross_entropy(logits, tgt_idx, T, V)
+        _lib.nt_tape_backward(loss_idx)
+        entries = ctypes.cast(_lib.nt_tape_get(), ctypes.POINTER(_NtTapeEntry))
+        gptr = entries[tids[param_idx]].grad
+        g_ana = (ctypes.cast(gptr, ctypes.POINTER(_NtTensor)).contents.data[elem]
+                 if gptr else 0.0)
+        _lib.nt_tape_clear()
+        # numeric: central difference via two forward-only steps
+        ts = _get_ts(self.params[param_idx]._ptr)
+        orig = ts.data[elem]
+        ts.data[elem] = orig + eps
+        loss_p = self.step(token_ids, target_ids, update=False)
+        ts.data[elem] = orig - eps
+        loss_m = self.step(token_ids, target_ids, update=False)
+        ts.data[elem] = orig
+        g_num = (loss_p - loss_m) / (2.0 * eps)
+        return g_ana, g_num
 
     def save(self, path):
         n = len(self.params)
