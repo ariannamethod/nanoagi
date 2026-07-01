@@ -41,6 +41,7 @@ CFG = dict(
     layer=_env_int('NANO_LAYER', 5), ctx=_env_int('NANO_CTX', 256),
     content=_env_int('NANO_CONTENT', 3), rrpram=_env_int('NANO_RRPRAM', 3),
     merges=_env_int('NANO_MERGES', 2048), steps=_env_int('NANO_STEPS', 12000),
+    karl_mb=_env_int('NANO_KARL_MB', 5),   # KARL learns merges on this many MB (they generalize)
     lr=_env_float('NANO_LR', 3e-4), val_every=_env_int('NANO_VAL_EVERY', 500),
     corpus_mb=_env_int('NANO_CORPUS_MB', 150),
     corpus_file=os.environ.get('NANO_CORPUS_FILE', ''),
@@ -144,11 +145,16 @@ def main():
 
     data = build_corpus()
 
-    # 2. KARL — learn once, FREEZE (tokenizer == inference)
+    # 2. KARL — learn merges on a bounded SAMPLE (BPE merges generalize), then FREEZE.
+    # Learning on the full corpus is a CPU trap: 2048 merges × full-corpus pair rescans over
+    # a Python token list. A few MB gives the same 2304-vocab; the merges tokenize the rest.
     karl = N.KARL(max_merges=CFG['merges'])
-    ids = karl.learn(data, num_merges=CFG['merges'])
+    km = CFG['karl_mb'] * 1_000_000
+    sample = data[:km] if (km > 0 and km < len(data)) else data
+    ids = karl.learn(sample, num_merges=CFG['merges'])
     V = karl.vocab_size
-    plog(f"KARL: vocab={V} merges={len(karl.merges)} tokens={len(ids):,} (frozen)")
+    plog(f"KARL: vocab={V} merges={len(karl.merges)} tokens={len(ids):,} "
+         f"(learned on {len(sample)/1e6:.1f}MB sample, frozen)")
 
     # held-out val split
     split = int(len(ids) * 0.9)
