@@ -2338,12 +2338,31 @@ def _arch_of(m):
 
 def _write_manifest(ckpt_path, tmodel, karl, steps):
     arch = _arch_of(tmodel)
+    # Dedup n_params by tensor pointer: tied wte/lm_head is ONE tensor, so
+    # tmodel.n_params() (which walks named_parameters and counts it twice) overstates
+    # the true parameter count by V*E. Report what actually trains and saves — the same
+    # deduped set NotorchEngine builds (notorch_nn.py: dedup by p._ptr).
+    _seen, _dedup = set(), 0
+    for _p in tmodel.parameters():
+        if _p._ptr not in _seen:
+            _seen.add(_p._ptr); _dedup += _p.numel
     arch.update({
         'format': _CHUCK_FORMAT,
-        'n_params': tmodel.n_params(),
+        'n_params': _dedup,
         'karl_merges': len(karl.merges),
         'steps': steps,
     })
+    # Integrity fields: sha256 + byte size of the weights, so a load can detect a
+    # corrupted/truncated checkpoint (nt_load checks tensor sizes but not the file digest).
+    try:
+        _h = hashlib.sha256()
+        with open(ckpt_path, 'rb') as _cf:
+            for _chunk in iter(lambda: _cf.read(1 << 20), b''):
+                _h.update(_chunk)
+        arch['sha256'] = _h.hexdigest()
+        arch['bytes'] = os.path.getsize(ckpt_path)
+    except OSError:
+        pass
     with open(_manifest_path(ckpt_path), 'w') as f:
         json.dump(arch, f, indent=2)
 

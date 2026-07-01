@@ -83,17 +83,28 @@ def build_corpus():
         plog(f"corpus: {out_path} ({len(data)/1e6:.1f} MB, cached)")
         return data
     plog(f"corpus: downloading {CFG['corpus_mb']} MB climbmix -> {out_path}")
-    chunks, got, t0 = [], 0, time.time()
+    chunks, got, t0, next_mark = [], 0, time.time(), 5_000_000
+    empties = 0
     while got < target:
         batch = N._download_climbmix_batch(num_docs=100)
         if not batch:
-            plog(f"  download stalled at {got/1e6:.1f} MB; using what we have")
-            break
+            # A single transient 429/timeout must NOT end the whole download (the 19.5MB
+            # stall was exactly this: break-on-first-empty). Back off and retry; only give
+            # up after a run of consecutive failures.
+            empties += 1
+            if empties >= 8:
+                plog(f"  download gave up at {got/1e6:.1f} MB after {empties} consecutive failures")
+                break
+            time.sleep(2.0 * empties)
+            continue
+        empties = 0
         for t in batch:
             b = (t + "\n\n").encode('utf-8', 'replace')
             chunks.append(b); got += len(b)
-        if len(chunks) % 1000 == 0:
+        if got >= next_mark:
             plog(f"  {got/1e6:.1f}/{CFG['corpus_mb']} MB  [{time.time()-t0:.0f}s]")
+            next_mark += 5_000_000
+        time.sleep(0.3)   # politeness — avoid tripping the rate limiter that caused the stall
     data = b''.join(chunks)
     with open(out_path, 'wb') as f:
         f.write(data)
@@ -151,10 +162,16 @@ def main():
     karl = N.KARL(max_merges=CFG['merges'])
     km = CFG['karl_mb'] * 1_000_000
     sample = data[:km] if (km > 0 and km < len(data)) else data
-    ids = karl.learn(sample, num_merges=CFG['merges'])
+    sample_ids = karl.learn(sample, num_merges=CFG['merges'])   # learn merges on bounded sample (fast)
     V = karl.vocab_size
+    # Tokenize the FULL corpus for training. karl.learn returns ONLY the sample's ids;
+    # training on that alone starved the 13.4M model in run #1 (~310K tokens -> val overfit
+    # 7.06->9.16). The whole point of downloading a large corpus is to train on it — so
+    # encode all of `data`. encode() is O(merges x bytes) in Python: the accepted CPU cost
+    # of using every byte. When sample IS the whole corpus (smoke), reuse sample_ids.
+    ids = sample_ids if sample is data else karl.encode(data)
     plog(f"KARL: vocab={V} merges={len(karl.merges)} tokens={len(ids):,} "
-         f"(learned on {len(sample)/1e6:.1f}MB sample, frozen)")
+         f"(merges on {len(sample)/1e6:.1f}MB sample; TRAINED on full {len(data)/1e6:.1f}MB corpus)")
 
     # held-out val split
     split = int(len(ids) * 0.9)
@@ -203,12 +220,17 @@ def main():
                 samp = flesh_sample(eng, karl, meta, "the model", n=40)
                 plog(f"     flesh> {samp[:200]!r}")
 
-    # 5. save weights + manifest (<80MB target)
+    # 5. save weights + manifest + KARL (<80MB target)
+    # KARL is persisted NEXT TO the weights: super.nt is tokenizer-specific (V=2304 came
+    # from these exact merges), so the checkpoint is useless for inference without them.
+    # The run's KARL was learned on an ephemeral corpus sample; save_state makes the
+    # deliverable self-contained and reproducible.
     eng.save(CFG['ckpt'])
     N._write_manifest(CFG['ckpt'], m, karl, steps)
+    karl.save_state(CFG['ckpt'] + '.karl')
     sz = os.path.getsize(CFG['ckpt']) / 1e6
     elapsed = time.time() - t0
-    plog(f"\nSAVED {CFG['ckpt']} ({sz:.1f} MB) + manifest  [{elapsed:.0f}s total]")
+    plog(f"\nSAVED {CFG['ckpt']} ({sz:.1f} MB) + manifest + KARL  [{elapsed:.0f}s total]")
     plog(f"crossover: |flesh| {pre_flesh:.4f} -> {flesh_magnitude(eng, train_ids, ctx):.4f}")
     plog(f"ghost>  {N.continue_phrase('the model', karl, meta, N.NanoAGI(vocab_size=V, context_len=CFG['ctx'], n_embd=CFG['embd'], n_head=CFG['head'], n_layer=CFG['layer'], n_content=CFG['content'], n_rrpram=CFG['rrpram']), max_tokens=40)[:200]!r}" if dedup < 2_000_000 else "ghost> (skipped: Python model too large to instantiate at scale)")
     plog(f"peak RSS: {rss_mb():.0f} MB | backend={nn.NOTORCH_BACKEND} gpu={nn.NOTORCH_GPU}")
