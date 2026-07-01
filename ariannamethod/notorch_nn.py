@@ -38,20 +38,33 @@ def _compile_libnotorch(src, out):
     the GPU. Returns 'cuda' | 'blas' | 'cpu'."""
     base = ['cc', '-O2', '-std=c11', '-shared', '-fPIC']
     cuda_src = os.path.join(_dir, 'notorch_cuda.cu')
-    # 1) CUDA: nvcc the kernels, then link notorch.c + cuBLAS/cudart (+BLAS for CPU ops)
+    require_cuda = os.environ.get('NANO_REQUIRE_CUDA') == '1'
+    # 1) CUDA: nvcc the kernels (-Xcompiler -fPIC so the host objects are PIC for the shared
+    #    lib), then link notorch.c + cuBLAS/cudart (+BLAS for CPU ops). Fail HARD when CUDA is
+    #    required — never a silent BLAS fallback that would train a "GPU" milestone on CPU.
     if shutil.which('nvcc') and os.path.exists(cuda_src):
-        try:
-            cu_o = os.path.join(_dir, 'notorch_cuda.o')
-            if subprocess.run(['nvcc', '-O2', '-DUSE_CUDA', '-c', cuda_src, '-o', cu_o],
-                              capture_output=True, text=True).returncode == 0:
-                link = base + ['-DUSE_CUDA', '-DUSE_BLAS', '-I/usr/local/cuda/include',
-                               '-o', out, src, cu_o,
-                               '-L/usr/local/cuda/lib64', '-lcudart', '-lcublas',
-                               '-lopenblas', '-lm']
-                if subprocess.run(link, capture_output=True, text=True).returncode == 0:
-                    return 'cuda'
-        except Exception:
-            pass
+        cu_o = os.path.join(_dir, 'notorch_cuda.o')
+        r1 = subprocess.run(['nvcc', '-O2', '-DUSE_CUDA', '-Xcompiler', '-fPIC',
+                             '-c', cuda_src, '-o', cu_o], capture_output=True, text=True)
+        if r1.returncode != 0:
+            msg = "nvcc failed:\n" + (r1.stderr or '')[-2000:]
+            if require_cuda:
+                raise RuntimeError(msg)
+            print("  [notorch] " + msg)
+        else:
+            link = base + ['-DUSE_CUDA', '-DUSE_BLAS', '-I/usr/local/cuda/include',
+                           '-o', out, src, cu_o,
+                           '-L/usr/local/cuda/lib64', '-lcudart', '-lcublas',
+                           '-lopenblas', '-lm']
+            r2 = subprocess.run(link, capture_output=True, text=True)
+            if r2.returncode == 0:
+                return 'cuda'
+            msg = "CUDA link failed:\n" + (r2.stderr or '')[-2000:]
+            if require_cuda:
+                raise RuntimeError(msg)
+            print("  [notorch] " + msg)
+    elif require_cuda:
+        raise RuntimeError("NANO_REQUIRE_CUDA=1 but nvcc / notorch_cuda.cu absent — refusing BLAS fallback")
     # 2) BLAS: notorch.c picks <Accelerate/Accelerate.h> only under -DACCELERATE
     if platform.system() == 'Darwin':
         blas = base + ['-DUSE_BLAS', '-DACCELERATE', '-o', out, src, '-framework', 'Accelerate', '-lm']
@@ -68,6 +81,14 @@ def _compile_libnotorch(src, out):
     raise RuntimeError("libnotorch compile failed (CUDA, BLAS and CPU)")
 
 
+# NANO_REQUIRE_CUDA forces a clean rebuild — a stale non-CUDA lib must not be reused on a GPU box
+if os.environ.get('NANO_REQUIRE_CUDA') == '1':
+    for _ext in ('.dylib', '.so', '.dll'):
+        try:
+            os.remove(os.path.join(_dir, f'libnotorch{_ext}'))
+        except OSError:
+            pass
+
 for ext in ['.dylib', '.so', '.dll']:
     _libpath = os.path.join(_dir, f'libnotorch{ext}')
     if os.path.exists(_libpath):
@@ -80,6 +101,12 @@ else:
         NOTORCH_BLAS = NOTORCH_BACKEND in ('blas', 'cuda')
 
 _lib = ctypes.CDLL(_libpath)
+
+# Infer backend from symbols when we loaded a PRE-EXISTING lib (didn't compile it here):
+# a CUDA build exposes gpu_init. Prevents NOTORCH_BACKEND=None hiding a real CUDA lib.
+if NOTORCH_BACKEND is None:
+    NOTORCH_BACKEND = 'cuda' if hasattr(_lib, 'gpu_init') else 'unknown'
+    NOTORCH_BLAS = NOTORCH_BACKEND == 'cuda'
 
 # GPU auto-detect (molequla pattern): a CUDA build exposes gpu_init / nt_set_gpu_mode;
 # enable device dispatch when a GPU is actually present, else stay on CPU/BLAS. No flag.
@@ -95,6 +122,10 @@ if hasattr(_lib, 'gpu_init') and hasattr(_lib, 'nt_set_gpu_mode'):
             NOTORCH_GPU = True
     except Exception:
         NOTORCH_GPU = False
+
+# Hard require-CUDA gate: on a GPU box we must actually be on GPU, not silently on BLAS.
+if os.environ.get('NANO_REQUIRE_CUDA') == '1' and not NOTORCH_GPU:
+    raise RuntimeError(f"NANO_REQUIRE_CUDA=1 but GPU not active (backend={NOTORCH_BACKEND}, gpu={NOTORCH_GPU})")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # C FUNCTION SIGNATURES
@@ -162,6 +193,14 @@ _lib.nt_load.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
 # RNG + tape
 _lib.nt_seed.argtypes = [ctypes.c_uint64]
 _lib.nt_tape_get.restype = ctypes.c_void_p
+_lib.nt_tensor_sync_cpu.argtypes = [ctypes.c_void_p]   # GPU→CPU sync before a CPU read (no-op on CPU build)
+
+
+def _sync_cpu(tensor_ptr):
+    """Download a tensor's GPU-fresh data to its CPU mirror before we read it from Python.
+    No-op on CPU/BLAS builds. Without it, GPU-resident forward outputs read as stale zeros."""
+    if tensor_ptr:
+        _lib.nt_tensor_sync_cpu(tensor_ptr)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STRUCTS
@@ -582,6 +621,7 @@ class NotorchEngine:
         # Read loss value
         tape_ptr = _lib.nt_tape_get()
         loss_val = ctypes.cast(tape_ptr, ctypes.POINTER(_NtTapeEntry))[loss_idx].output
+        _sync_cpu(loss_val)   # loss may be GPU-fresh from a cuBLAS CE reduction
         loss_val = ctypes.cast(loss_val, ctypes.POINTER(_NtTensor)).contents.data[0]
 
         # Backward + optimizer step (skipped for forward-only eval — no train-on-val leak)
@@ -615,6 +655,7 @@ class NotorchEngine:
         logits_idx = self._forward(token_ids)
         tape_ptr = _lib.nt_tape_get()
         out_ptr = ctypes.cast(tape_ptr, ctypes.POINTER(_NtTapeEntry))[logits_idx].output
+        _sync_cpu(out_ptr)   # logits may be GPU-fresh — sync before the CPU read (else zeros)
         lts = ctypes.cast(out_ptr, ctypes.POINTER(_NtTensor)).contents
         base = (T - 1) * V
         row = [lts.data[base + j] for j in range(V)]
@@ -642,6 +683,7 @@ class NotorchEngine:
         _lib.nt_tape_backward(loss_idx)
         entries = ctypes.cast(_lib.nt_tape_get(), ctypes.POINTER(_NtTapeEntry))
         gptr = entries[tids[param_idx]].grad
+        _sync_cpu(gptr)   # grad may be GPU-fresh after backward — sync before the CPU read
         g_ana = (ctypes.cast(gptr, ctypes.POINTER(_NtTensor)).contents.data[elem]
                  if gptr else 0.0)
         _lib.nt_tape_clear()
