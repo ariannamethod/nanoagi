@@ -39,12 +39,24 @@ def _compile_libnotorch(src, out):
     base = ['cc', '-O2', '-std=c11', '-shared', '-fPIC']
     cuda_src = os.path.join(_dir, 'notorch_cuda.cu')
     require_cuda = os.environ.get('NANO_REQUIRE_CUDA') == '1'
+    # nvcc may not be on PATH even in a CUDA image — fall back to the standard install path.
+    nvcc = shutil.which('nvcc')
+    if not nvcc:
+        for _c in ('/usr/local/cuda/bin/nvcc', '/usr/local/cuda-12.4/bin/nvcc',
+                   '/usr/local/cuda-12/bin/nvcc'):
+            if os.path.exists(_c):
+                nvcc = _c
+                break
+    # cuBLAS/cudart live in lib64 on some installs, targets/<arch>/lib on others — try both.
+    _cuda_libdirs = ['-L/usr/local/cuda/lib64',
+                     '-L/usr/local/cuda/targets/x86_64-linux/lib',
+                     '-L/usr/local/cuda-12.4/targets/x86_64-linux/lib']
     # 1) CUDA: nvcc the kernels (-Xcompiler -fPIC so the host objects are PIC for the shared
     #    lib), then link notorch.c + cuBLAS/cudart (+BLAS for CPU ops). Fail HARD when CUDA is
     #    required — never a silent BLAS fallback that would train a "GPU" milestone on CPU.
-    if shutil.which('nvcc') and os.path.exists(cuda_src):
+    if nvcc and os.path.exists(cuda_src):
         cu_o = os.path.join(_dir, 'notorch_cuda.o')
-        r1 = subprocess.run(['nvcc', '-O2', '-DUSE_CUDA', '-Xcompiler', '-fPIC',
+        r1 = subprocess.run([nvcc, '-O2', '-DUSE_CUDA', '-Xcompiler', '-fPIC',
                              '-c', cuda_src, '-o', cu_o], capture_output=True, text=True)
         if r1.returncode != 0:
             msg = "nvcc failed:\n" + (r1.stderr or '')[-2000:]
@@ -53,9 +65,8 @@ def _compile_libnotorch(src, out):
             print("  [notorch] " + msg)
         else:
             link = base + ['-DUSE_CUDA', '-DUSE_BLAS', '-I/usr/local/cuda/include',
-                           '-o', out, src, cu_o,
-                           '-L/usr/local/cuda/lib64', '-lcudart', '-lcublas',
-                           '-lopenblas', '-lm']
+                           '-o', out, src, cu_o] + _cuda_libdirs + \
+                          ['-lcudart', '-lcublas', '-lopenblas', '-lm']
             r2 = subprocess.run(link, capture_output=True, text=True)
             if r2.returncode == 0:
                 return 'cuda'
