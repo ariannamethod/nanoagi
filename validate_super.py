@@ -102,5 +102,19 @@ else:
     else:
         print(f"check5 PASS: integrity — sha256 {digest[:16]}… + {size} bytes match manifest")
 
-print("\n" + ("VALIDATE: FAIL — " + "; ".join(fails) if fails else "VALIDATE: PASS (5/5)"))
+# ── KARL sidecar: the weights are tokenizer-specific, so a shippable checkpoint must ship
+#    its KARL. load_state must reconstruct the SAME vocab the weights were trained against. ──
+sidecar = CKPT + '.karl'
+if not os.path.exists(sidecar):
+    fails.append(f"check6: KARL sidecar {sidecar} missing — weights have no tokenizer (not shippable)")
+else:
+    k = N.KARL()
+    if not k.load_state(sidecar):
+        fails.append("check6: KARL sidecar failed to load")
+    elif k.vocab_size != V:
+        fails.append(f"check6: KARL vocab {k.vocab_size} != manifest vocab {V}")
+    else:
+        print(f"check6 PASS: KARL sidecar loads, vocab={k.vocab_size} matches manifest")
+
+print("\n" + ("VALIDATE: FAIL — " + "; ".join(fails) if fails else "VALIDATE: PASS (6/6)"))
 sys.exit(1 if fails else 0)

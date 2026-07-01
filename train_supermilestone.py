@@ -138,11 +138,18 @@ def flesh_sample(eng, karl, meta, prompt, n=48, temp=0.8, topk=20):
 
 
 def flesh_magnitude(eng, ids, ctx, n=16):
-    """Mean |flesh logit| — grows as Chuck trains; the ghost->flesh crossover signal."""
-    random.seed(999)
+    """Mean |flesh logit| — grows as Chuck trains; the ghost->flesh crossover signal.
+
+    Uses a LOCAL rng: this is called every val_every steps, and the old global
+    random.seed(999) reset the SAME global RNG the training loop draws its windows from,
+    so every cycle re-drew the identical ~n_val windows -> the model saw a few hundred
+    windows ~30x and the rest of the corpus never (the true root of run #1's overfit,
+    independent of corpus size). A local Random keeps the metric fixed-sample AND leaves
+    the training window stream untouched."""
+    rng = random.Random(999)
     tot = 0.0
     for _ in range(n):
-        i = random.randint(0, max(0, len(ids) - ctx - 2))
+        i = rng.randint(0, max(0, len(ids) - ctx - 2))
         row = eng.forward_logits(ids[i:i+ctx])
         tot += sum(abs(x) for x in row) / len(row)
     return tot / n
